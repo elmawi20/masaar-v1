@@ -1,0 +1,58 @@
+# Dependencies
+/node_modules
+/.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# Next.js & Build Output
+/.next/
+/out/
+/build
+/dist
+*.tsbuildinfo
+next-env.d.ts
+
+# Environment & Credentials
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.cert
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Database & System Backups
+*.sql
+*.bak
+*.dump
+*.sqlite
+*.sqlite3
+/backups/
+
+# Uploaded Medical Documents & Static Uploads
+/uploads/
+/public/uploads/
+/public/documents/
+*.pdf
+*.dcm
+*.dicom
+
+# Exported Patient & Clinic Data
+/exports/
+*.csv
+*.xlsx
+
+# Testing & Coverage
+/coverage
+
+# Vercel
+.vercel
+
+# Operating System Files
+.DS_Store
+Thumbs.db
