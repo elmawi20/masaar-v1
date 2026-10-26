@@ -43,10 +43,14 @@ export function EventCalendarView({
     rooms,
     users,
     language,
+    currentRole,
     rescheduleAppointment,
+    checkAppointmentConflict,
+    updateAppointmentStatus,
     deleteAppointment,
     addAppointment,
     updatePatient,
+    getAppointmentPaymentStatus,
   } = useClinic();
 
   const isAr = language === 'ar';
@@ -212,9 +216,11 @@ export function EventCalendarView({
   // 3. Unscheduled / Waitlist Patients (Patient List)
   // ------------------------------------------------------------------
   const waitlistItems = useMemo(() => {
-    // Scheduled patient IDs on the current date
+    // Scheduled patient IDs on the current date (excluding cancelled and waitlisted)
     const scheduledPatientIdsToday = new Set(
-      appointments.filter((a) => a.date === currentDateStr && a.status !== 'cancelled').map((a) => a.patientId)
+      appointments
+        .filter((a) => a.date === currentDateStr && a.status !== 'cancelled' && a.status !== 'waitlisted')
+        .map((a) => a.patientId)
     );
 
     const list: Array<{
@@ -236,7 +242,7 @@ export function EventCalendarView({
         list.push({
           id: `wait-${pat.id}`,
           patient: pat,
-          type: pat.primaryDiagnosis || 'Therapy Session',
+          type: currentRole === 'receptionist' ? (isAr ? 'جلسة علاج' : 'Rehab Session') : (pat.primaryDiagnosis || 'Therapy Session'),
           theme,
           doctorName,
           initials: getPatientInitials(pat.fullName),
@@ -359,7 +365,7 @@ export function EventCalendarView({
 
     if (payload.type === 'appointment') {
       // Moving an existing scheduled appointment
-      rescheduleAppointment(
+      const reschedResult = rescheduleAppointment(
         payload.id,
         time24,
         currentDateStr,
@@ -367,8 +373,12 @@ export function EventCalendarView({
         res.roomId,
         res.bedNumber
       );
+      if (reschedResult && !reschedResult.success) {
+        alert(reschedResult.error || (isAr ? 'تعارض في المواعيد - تم إلغاء النقل' : 'Scheduling conflict - move cancelled'));
+        return;
+      }
     } else if (payload.type === 'waitlist' && payload.patientId) {
-      // Scheduling a waitlist patient - preserve the exact doctor assigned to the patient
+      // Scheduling a waitlist patient
       const patient = patients.find((p) => p.id === payload.patientId);
       const pkg = packages.find((p) => p.patientId === payload.patientId && p.status === 'active');
       
@@ -378,19 +388,58 @@ export function EventCalendarView({
         users.find((u) => u.role === 'physiotherapist' || u.role === 'diet_doctor')?.id ||
         users[0]?.id;
 
-      addAppointment({
-        patientId: payload.patientId,
-        physioId: assignedDoctorId,
-        packageId: pkg?.id,
-        date: currentDateStr,
-        startTime: time24,
-        duration: 45,
-        roomOrBed: roomLabel,
-        status: 'scheduled',
-        sessionType: payload.treatmentType?.toLowerCase().includes('diet') ? 'nutrition' : 'physiotherapy',
-        roomId: res.roomId,
-        bedNumber: res.bedNumber,
-      });
+      const targetSessionType = payload.treatmentType?.toLowerCase().includes('diet') ? 'nutrition' : 'physiotherapy';
+
+      // Check if patient already has a waitlisted appointment record
+      const existingWaitlistedApt = appointments.find(
+        (a) => a.patientId === payload.patientId && a.status === 'waitlisted'
+      );
+
+      if (existingWaitlistedApt) {
+        const reschedResult = rescheduleAppointment(
+          existingWaitlistedApt.id,
+          time24,
+          currentDateStr,
+          roomLabel,
+          res.roomId,
+          res.bedNumber
+        );
+        if (reschedResult && !reschedResult.success) {
+          alert(reschedResult.error || (isAr ? 'تعارض في المواعيد - تم إلغاء النقل' : 'Scheduling conflict - move cancelled'));
+          return;
+        }
+      } else {
+        const conflict = checkAppointmentConflict({
+          patientId: payload.patientId,
+          physioId: assignedDoctorId,
+          date: currentDateStr,
+          startTime: time24,
+          duration: 45,
+          roomId: res.roomId,
+          bedNumber: res.bedNumber,
+          sessionType: targetSessionType,
+        });
+
+        if (conflict.hasConflict) {
+          alert(conflict.reason || (isAr ? 'تعارض في المواعيد' : 'Scheduling conflict'));
+          return;
+        }
+
+        addAppointment({
+          patientId: payload.patientId,
+          physioId: assignedDoctorId,
+          packageId: pkg?.id,
+          date: currentDateStr,
+          startTime: time24,
+          duration: 45,
+          price: pkg ? 0 : 450,
+          roomOrBed: roomLabel,
+          status: 'scheduled',
+          sessionType: targetSessionType,
+          roomId: res.roomId,
+          bedNumber: res.bedNumber,
+        });
+      }
     }
   };
 
@@ -409,8 +458,8 @@ export function EventCalendarView({
         if (appt && appt.physioId) {
           updatePatient(appt.patientId, { assignedPhysioId: appt.physioId });
         }
-        // Remove appointment to return patient to waitlist
-        deleteAppointment(payload.id);
+        // Do NOT call deleteAppointment! Set status 'waitlisted' and keep the record
+        updateAppointmentStatus(payload.id, 'waitlisted');
         const container = e.currentTarget;
         playBounceAnimation(container);
       }
@@ -627,24 +676,31 @@ export function EventCalendarView({
                         const doctorName = doc?.name || (isAr ? 'أخصائي العيادة' : 'Physiotherapist');
                         const cardTheme = getAppointmentTheme(pat?.paymentType);
                         const initials = getPatientInitials(patientName);
+                        const payStatus = getAppointmentPaymentStatus(appt.id);
+
+                        const isDraggable = appt.status === 'scheduled' || appt.status === 'arrived';
 
                         return (
                           <div
                             key={appt.id}
                             id={appt.id}
-                            draggable
-                            onDragStart={(e) =>
+                            draggable={isDraggable}
+                            onDragStart={(e) => {
+                              if (!isDraggable) {
+                                e.preventDefault();
+                                return;
+                              }
                               handleDragStart(e, {
                                 type: 'appointment',
                                 id: appt.id,
                                 patientId: appt.patientId,
                                 treatmentType: appt.sessionType,
                                 physioId: appt.physioId,
-                              })
-                            }
+                              });
+                            }}
                             onDragEnd={handleDragEnd}
                             onClick={() => onSelectAppointment?.(appt)}
-                            className={`appointment-card ${cardTheme.cardClass} m-1 rounded-xl p-2.5 cursor-grab active:cursor-grabbing w-auto text-left rtl:text-right flex flex-col justify-between transition-all hover:scale-[1.01] select-none font-sans relative group/card border shadow-xs`}
+                            className={`appointment-card ${cardTheme.cardClass} m-1 rounded-xl p-2.5 ${isDraggable ? 'cursor-grab active:cursor-grabbing' : 'cursor-pointer'} w-auto text-left rtl:text-right flex flex-col justify-between transition-all hover:scale-[1.01] select-none font-sans relative group/card border shadow-xs`}
                           >
                             {/* Top Row: Patient Name (prominent font-semibold) + Circular Initials Avatar (top right) */}
                             <div className="flex items-start justify-between gap-1.5 min-w-0">
@@ -656,15 +712,31 @@ export function EventCalendarView({
                               </span>
                             </div>
 
-                            {/* Bottom Row: Doctor Name (smaller and slightly faded) + Patient Categorization Badge */}
+                            {/* Bottom Row: Doctor Name + Status & Payment Badge */}
                             <div className="flex items-center justify-between gap-1 mt-1.5 pt-1 border-t border-black/5 dark:border-white/5">
                               <div className="text-[11px] opacity-75 truncate flex items-center gap-1 font-normal min-w-0">
                                 <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${cardTheme.dotColor}`} />
                                 <span className="truncate">{doctorName}</span>
                               </div>
-                              <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded-full shrink-0 ${cardTheme.tagClass}`}>
-                                {cardTheme.tagText}
-                              </span>
+                              <div className="flex items-center gap-1 shrink-0">
+                                <span className={`text-[9px] font-bold px-1.5 py-0.2 rounded-full ${
+                                  payStatus.status === 'package'
+                                    ? 'bg-teal-100 text-teal-800 dark:bg-teal-950/60 dark:text-teal-300'
+                                    : payStatus.status === 'paid'
+                                    ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                                    : payStatus.status === 'partial'
+                                    ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
+                                    : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300'
+                                }`}>
+                                  {payStatus.status === 'package' ? (isAr ? 'باقة' : 'Pkg') :
+                                   payStatus.status === 'paid' ? (isAr ? 'مدفوع' : 'Paid') :
+                                   payStatus.status === 'partial' ? (isAr ? 'متبقي' : 'Due') :
+                                   (isAr ? 'غير مدفوع' : 'Unpaid')}
+                                </span>
+                                <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded-full shrink-0 ${cardTheme.tagClass}`}>
+                                  {cardTheme.tagText}
+                                </span>
+                              </div>
                             </div>
                           </div>
                         );

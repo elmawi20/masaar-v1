@@ -23,7 +23,7 @@ interface UrgentAlertsModalProps {
 }
 
 export function UrgentAlertsModal({ isOpen, onClose }: UrgentAlertsModalProps) {
-  const { patients, packages, clinic, language } = useClinic();
+  const { patients, packages, clinic, language, currentRole } = useClinic();
   const isAr = language === 'ar';
 
   const [selectedPaymentPackage, setSelectedPaymentPackage] = useState<TreatmentPackage | null>(null);
@@ -146,9 +146,11 @@ export function UrgentAlertsModal({ isOpen, onClose }: UrgentAlertsModalProps) {
                             • {patient.phone}
                           </span>
                         </div>
-                        <p className="text-xs text-slate-600 dark:text-slate-400 font-medium mt-0.5">
-                          🩺 {patient.primaryDiagnosis}
-                        </p>
+                        {currentRole !== 'receptionist' && patient.primaryDiagnosis && (
+                          <p className="text-xs text-slate-600 dark:text-slate-400 font-medium mt-0.5">
+                            🩺 {patient.primaryDiagnosis}
+                          </p>
+                        )}
                       </div>
 
                       {/* Alert Badges */}

@@ -51,12 +51,14 @@ export interface Patient {
 }
 
 export type PaymentMethod = 'instapay' | 'vodafone_cash' | 'fawry' | 'cash' | 'visa';
-export type PackageStatus = 'active' | 'completed';
+export type PackageStatus = 'active' | 'completed' | 'expired' | 'forfeited';
 
 export interface PaymentReceipt {
   id: string;
   clinicId: string;
-  packageId: string;
+  receiptNumber?: string; // Sequential: e.g. "INV-2026-00001"
+  packageId?: string;
+  appointmentId?: string;
   patientId: string;
   amount: number; // in EGP
   paymentMethod: PaymentMethod;
@@ -64,6 +66,10 @@ export interface PaymentReceipt {
   receiptImage?: string; // Base64 compressed image (WebP)
   notes?: string;
   collectedBy?: string;
+  isVoided?: boolean;
+  voidedAt?: string;
+  voidedBy?: string;
+  voidReason?: string;
 }
 
 export interface TreatmentPackage {
@@ -75,11 +81,13 @@ export interface TreatmentPackage {
   completedSessions: number;
   remainingSessions: number;
   totalPrice: number; // in EGP
-  amountPaid: number; // in EGP
-  balanceDue: number; // in EGP
-  paymentMethod: PaymentMethod;
+  amountPaid: number; // calculated from receipts
+  balanceDue: number; // calculated: totalPrice - amountPaid
+  paymentMethod?: PaymentMethod;
   status: PackageStatus;
   startDate: string;
+  purchaseDate?: string; // YYYY-MM-DD
+  expiryDate?: string; // YYYY-MM-DD (= purchaseDate + 60 days)
   receipts?: PaymentReceipt[];
 }
 
@@ -94,7 +102,7 @@ export interface PackageTier {
   isActive: boolean;
 }
 
-export type AppointmentStatus = 'scheduled' | 'completed' | 'cancelled' | 'no-show';
+export type AppointmentStatus = 'scheduled' | 'completed' | 'cancelled' | 'no-show' | 'arrived' | 'waitlisted';
 
 export type SessionType = 'physiotherapy' | 'nutrition' | 'consultant_assessment';
 export type ClinicalNeedCategory = 'physiotherapy' | 'nutrition' | 'head_consultant';
@@ -114,7 +122,8 @@ export interface Appointment {
   packageId?: string;
   date: string; // YYYY-MM-DD
   startTime: string; // HH:MM
-  duration: number; // in minutes (default 45)
+  duration: number; // in minutes (15-min steps, min 15, max 180)
+  price?: number; // in EGP (required, entered at booking)
   roomOrBed: string; // e.g. "Bed 1 (Electrotherapy)", "Gym / Functional Rehab"
   status: AppointmentStatus;
   sessionType?: SessionType;
@@ -128,6 +137,10 @@ export interface Appointment {
   bedNumber?: number;
   doctorNotes?: string;
   attachments?: string[];
+  cancellationReason?: string;
+  cancelledAt?: string;
+  noShowReason?: string;
+  markedNoShowAt?: string;
 }
 
 export interface ClinicNotification {
@@ -214,6 +227,8 @@ export interface AuditLog {
   userRole: UserRole;
   action: string;
   details: string;
+  before?: any;
+  after?: any;
   timestamp: string;
 }
 

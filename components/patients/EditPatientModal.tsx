@@ -3,16 +3,18 @@
 import React, { useState } from 'react';
 import { useClinic } from '@/context/ClinicContext';
 import { Patient, PatientStatus, Gender, PatientPaymentType } from '@/types';
-import { X, Check, UserCheck, ShieldAlert, Sparkles } from 'lucide-react';
+import { X, Check, UserCheck, ShieldAlert, Sparkles, FolderOpen } from 'lucide-react';
+import { validateEgyptianPhone, normalizeEgyptianPhone } from '@/lib/utils';
 
 interface EditPatientModalProps {
   isOpen: boolean;
   onClose: () => void;
   patient: Patient;
+  onOpenPatientFile?: (patient: Patient) => void;
 }
 
-export function EditPatientModal({ isOpen, onClose, patient }: EditPatientModalProps) {
-  const { users, language, dir, updatePatient, currentRole } = useClinic();
+export function EditPatientModal({ isOpen, onClose, patient, onOpenPatientFile }: EditPatientModalProps) {
+  const { patients, users, language, dir, updatePatient, currentRole } = useClinic();
   const isAr = language === 'ar';
 
   const physios = users.filter((u) => u.role === 'physiotherapist' || u.role === 'admin');
@@ -29,11 +31,37 @@ export function EditPatientModal({ isOpen, onClose, patient }: EditPatientModalP
   const [referringDoctor, setReferringDoctor] = useState(patient.referringDoctor || '');
   const [notes, setNotes] = useState(patient.notes || '');
 
+  // Real-Time Egyptian Phone Validation and Unique Collision Detection (Rule 1)
+  const normalizedPhone = normalizeEgyptianPhone(phone);
+  const isPhoneValid = !phone.trim() || validateEgyptianPhone(phone);
+  const conflictPatient =
+    normalizedPhone.length >= 10
+      ? patients.find((p) => p.id !== patient.id && normalizeEgyptianPhone(p.phone) === normalizedPhone)
+      : null;
+
   if (!isOpen) return null;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!fullName.trim() || !phone.trim()) return;
+
+    if (!validateEgyptianPhone(phone)) {
+      alert(
+        isAr
+          ? 'يرجى إدخال رقم هاتف مصري صحيح يبدأ بـ 010 أو 011 أو 012 أو 015.'
+          : 'Please enter a valid Egyptian mobile format: /^(\\+20|0)?1[0125][0-9]{8}$/.'
+      );
+      return;
+    }
+
+    if (conflictPatient) {
+      alert(
+        isAr
+          ? `لا يمكن حفظ التعديل: رقم الهاتف مسجل بالفعل للمريض ${conflictPatient.fullName} (ID: ${conflictPatient.id}).`
+          : `Cannot save: Phone number is already registered for ${conflictPatient.fullName} (ID: ${conflictPatient.id}).`
+      );
+      return;
+    }
 
     updatePatient(patient.id, {
       fullName: fullName.trim(),
@@ -107,10 +135,55 @@ export function EditPatientModal({ isOpen, onClose, patient }: EditPatientModalP
                 required
                 value={phone}
                 onChange={(e) => setPhone(e.target.value)}
-                className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-teal-500 font-mono"
+                className={`w-full bg-slate-50 dark:bg-slate-800 border rounded-xl px-3 py-2 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 font-mono ${
+                  !isPhoneValid && phone.trim()
+                    ? 'border-rose-400 focus:ring-rose-500'
+                    : conflictPatient
+                    ? 'border-rose-400 focus:ring-rose-500'
+                    : 'border-slate-200 dark:border-slate-700 focus:ring-teal-500'
+                }`}
               />
+              {!isPhoneValid && phone.trim() && (
+                <p className="text-[11px] text-rose-600 dark:text-rose-400 mt-1 font-semibold">
+                  {isAr
+                    ? 'صيغة غير صحيحة: يجب أن يكون رقماً مصرياً يبدأ بـ 010 أو 011 أو 012 أو 015 ويتكون من 11 رقماً.'
+                    : 'Invalid Egyptian mobile format: must match /^(\\+20|0)?1[0125][0-9]{8}$/.'}
+                </p>
+              )}
             </div>
           </div>
+
+          {/* Real-Time Unique Phone Block Banner (Rule 1) */}
+          {conflictPatient && (
+            <div className="p-3 bg-rose-50 dark:bg-rose-950/40 border-2 border-rose-300 dark:border-rose-800 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 animate-in fade-in">
+              <div className="flex items-start gap-2">
+                <ShieldAlert className="w-5 h-5 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
+                <div className="text-xs">
+                  <h5 className="font-extrabold text-rose-950 dark:text-rose-200">
+                    {isAr ? 'تعارض: رقم الهاتف مسجل لمريض آخر!' : 'Conflict: Phone number belongs to another patient!'}
+                  </h5>
+                  <p className="text-rose-800 dark:text-rose-300 mt-0.5">
+                    <strong className="text-slate-900 dark:text-white underline">{conflictPatient.fullName}</strong> •{' '}
+                    <span className="font-mono font-bold">ID: {conflictPatient.id}</span>
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (onOpenPatientFile) {
+                    onOpenPatientFile(conflictPatient);
+                  } else {
+                    onClose();
+                  }
+                }}
+                className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-bold text-xs shadow-xs transition flex items-center gap-1.5 whitespace-nowrap self-start sm:self-auto cursor-pointer"
+              >
+                <FolderOpen className="w-3.5 h-3.5" />
+                <span>{isAr ? 'فتح ملف المريض' : 'Open patient file'}</span>
+              </button>
+            </div>
+          )}
 
           {/* WhatsApp & Age */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -262,7 +335,8 @@ export function EditPatientModal({ isOpen, onClose, patient }: EditPatientModalP
             </button>
             <button
               type="submit"
-              className="px-5 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold transition flex items-center space-x-1.5 rtl:space-x-reverse text-xs sm:text-sm shadow-xs"
+              disabled={Boolean(conflictPatient) || !isPhoneValid}
+              className="px-5 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold transition flex items-center space-x-1.5 rtl:space-x-reverse text-xs sm:text-sm shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Check className="w-4 h-4" />
               <span>{isAr ? 'حفظ التغييرات' : 'Save Changes'}</span>

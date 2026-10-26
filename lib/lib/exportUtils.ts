@@ -72,7 +72,7 @@ export function exportReceiptsToCSV(
       r.id,
       r.date,
       `"${(pat?.fullName || 'Patient').replace(/"/g, '""')}"`,
-      `"${(pkg?.packageName || r.packageId).replace(/"/g, '""')}"`,
+      `"${(pkg?.packageName || r.packageId || 'Direct Payment').replace(/"/g, '""')}"`,
       r.amount,
       r.paymentMethod,
       `"${(r.collectedBy || 'Staff').replace(/"/g, '""')}"`,

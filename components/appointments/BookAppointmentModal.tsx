@@ -36,7 +36,7 @@ export function BookAppointmentModal({
   defaultBedNumber,
   defaultPatientId,
 }: BookAppointmentModalProps) {
-  const { patients, users, packages, rooms, appointments, language, dir, addAppointment } = useClinic();
+  const { patients, users, packages, rooms, appointments, language, dir, addAppointment, checkAppointmentConflict } = useClinic();
   const isAr = language === 'ar';
 
   const todayStr = new Date().toISOString().split('T')[0];
@@ -60,6 +60,9 @@ export function BookAppointmentModal({
   const [physioId, setPhysioId] = useState(defaultRoomId ? (users.find((u) => u.role === 'physiotherapist')?.id || users[0]?.id || '') : (filteredDoctors[0]?.id || ''));
   const [date, setDate] = useState(defaultDate || todayStr);
   const [time, setTime] = useState(defaultTime || '10:00');
+  const [duration, setDuration] = useState<number>(45);
+  const [price, setPrice] = useState<number | ''>(350);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [selectedRoomId, setSelectedRoomId] = useState<string>(defaultRoomId || activeRooms[0]?.id || '');
   const [selectedBedNumber, setSelectedBedNumber] = useState<number>(defaultBedNumber || 1);
   const [isSuccess, setIsSuccess] = useState(false);
@@ -72,12 +75,15 @@ export function BookAppointmentModal({
     if (cat === 'nutrition') {
       const dietDoc = users.find((u) => u.role === 'diet_doctor' || u.id === 'user-06');
       if (dietDoc) setPhysioId(dietDoc.id);
+      setPrice(350);
     } else if (cat === 'consultant_assessment') {
       const headDoc = users.find((u) => u.role === 'admin' || u.id === 'user-01');
       if (headDoc) setPhysioId(headDoc.id);
+      setPrice(450);
     } else {
       const physDoc = users.find((u) => u.role === 'physiotherapist');
       if (physDoc) setPhysioId(physDoc.id);
+      setPrice(350);
     }
   };
 
@@ -101,100 +107,31 @@ export function BookAppointmentModal({
     (pkg) => pkg.patientId === patientId && pkg.status === 'active'
   );
 
-  // CONFLICT DETECTION LOGIC:
-  // Helper to check if two time strings overlap in a 45-min session window
-  const getConflictWarning = () => {
-    if (!date || !time) return null;
-
-    const timeParts = time.split(':');
-    const newMinutes = parseInt(timeParts[0], 10) * 60 + parseInt(timeParts[1] || '0', 10);
-
-    // 1. Check Single Daily Reservation Rule:
-    // A patient can only have 1 Physio session and 1 Nutrition session per day. Cannot book duplicate sessions of the same type on the same date.
-    const existingSameDaySession = appointments.find((apt) => {
-      if (apt.date !== date || apt.status === 'cancelled' || apt.status === 'no-show') return false;
-      if (apt.patientId !== patientId) return false;
-
-      const isAptNutrition = apt.sessionType === 'nutrition';
-      const isTargetNutrition = sessionCategory === 'nutrition';
-
-      // Conflict if both are physio (or assessment) OR both are nutrition
-      return isAptNutrition === isTargetNutrition;
-    });
-
-    if (existingSameDaySession) {
-      const isNut = sessionCategory === 'nutrition';
-      return isAr
-        ? `⚠️ حجز مسبق في نفس اليوم: المريض لديه بالفعل جلسة ${isNut ? 'تغذية' : 'علاج طبيعي'} مجدولة في هذا التاريخ (${date}) الساعة (${formatTime12h(existingSameDaySession.startTime, language)}). مسموح بجلسة واحدة يومياً لكل نوع (جلسة علاج طبيعي + جلسة تغذية فقط).`
-        : `⚠️ Daily Limit: Patient already has a ${isNut ? 'Nutrition' : 'Physiotherapy'} session booked on ${date} at ${formatTime12h(existingSameDaySession.startTime, language)}. Only 1 Physio and 1 Nutrition session allowed per day.`;
-    }
-
-    // 2. Check Physio double-booking: Does this physio already have an active appointment on this date and time?
-    const physioConflict = appointments.find((apt) => {
-      if (apt.date !== date || apt.status === 'cancelled' || apt.status === 'no-show') return false;
-      if (apt.physioId !== physioId) return false;
-
-      const aptParts = apt.startTime.split(':');
-      const aptMinutes = parseInt(aptParts[0], 10) * 60 + parseInt(aptParts[1] || '0', 10);
-      return Math.abs(aptMinutes - newMinutes) < 45;
-    });
-
-    if (physioConflict) {
-      const conflictDoc = users.find((u) => u.id === physioConflict.physioId);
-      const conflictPatient = patients.find((p) => p.id === physioConflict.patientId);
-      return isAr
-        ? `⚠️ تعارض في المواعيد: الطبيب (${conflictDoc?.name || 'المعالج'}) لديه جلسة محجوزة بالفعل في هذا التوقيت (${formatTime12h(physioConflict.startTime, language)}) مع المريض (${conflictPatient?.fullName || 'آخر'}).`
-        : `⚠️ Scheduling Conflict: Dr. ${conflictDoc?.name || 'Physio'} is already booked at ${formatTime12h(physioConflict.startTime, language)} with ${conflictPatient?.fullName || 'another patient'}.`;
-    }
-
-    // 3. Check Room & Bed Capacity Conflict: Is this exact bed or room over capacity?
-    if (currentRoom) {
-      const roomApts = appointments.filter((apt) => {
-        if (apt.date !== date || apt.status === 'cancelled' || apt.status === 'no-show') return false;
-        const isSameRoom =
-          (apt.roomId && apt.roomId === currentRoom.id) ||
-          (apt.roomOrBed && (apt.roomOrBed.includes(currentRoom.nameEn) || apt.roomOrBed.includes(currentRoom.nameAr)));
-        if (!isSameRoom) return false;
-
-        const aptParts = apt.startTime.split(':');
-        const aptMinutes = parseInt(aptParts[0], 10) * 60 + parseInt(aptParts[1] || '0', 10);
-        return Math.abs(aptMinutes - newMinutes) < 45;
-      });
-
-      // Specific bed occupied?
-      const bedConflict = roomApts.find(
-        (apt) => apt.bedNumber === selectedBedNumber || apt.roomOrBed.includes(`Bed ${selectedBedNumber}`) || apt.roomOrBed.includes(`سرير ${selectedBedNumber}`)
-      );
-
-      if (bedConflict) {
-        return isAr
-          ? `⚠️ السرير محجوز: (سرير ${selectedBedNumber}) في (${currentRoom.nameAr || currentRoom.nameEn}) محجوز بالفعل في هذا التوقيت.`
-          : `⚠️ Bed Occupied: Bed ${selectedBedNumber} in ${currentRoom.nameEn} is already taken at this time.`;
-      }
-
-      if (roomApts.length >= currentRoom.bedCount) {
-        return isAr
-          ? `⚠️ الغرفة مكتملة: (${currentRoom.nameAr || currentRoom.nameEn}) مشغولة بالكامل بكامل طاقتها (${currentRoom.bedCount} أسِرّة) في هذا التوقيت.`
-          : `⚠️ Room Full: ${currentRoom.nameEn} is at max capacity (${currentRoom.bedCount} beds) at this time.`;
-      }
-    }
-
-    return null;
-  };
-
-  const currentConflict = getConflictWarning();
+  // CONFLICT DETECTION LOGIC (centralized in ClinicContext, enforces overlap & package expiry):
+  const currentConflict = checkAppointmentConflict({
+    patientId,
+    physioId,
+    date,
+    startTime: time,
+    duration,
+    roomId: selectedRoomId,
+    bedNumber: selectedBedNumber,
+    sessionType: sessionCategory,
+    packageId: patientActivePackage?.id,
+  }).reason || null;
 
   if (!isOpen) return null;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!patientId || !physioId || !date || !time) return;
+    if (!patientId || !physioId || !date || !time || price === '' || isSubmitting) return;
 
     if (currentConflict) {
       setConflictError(currentConflict);
       return;
     }
 
+    setIsSubmitting(true);
     const roomName = isAr ? currentRoom?.nameAr || currentRoom?.nameEn : currentRoom?.nameEn;
     const roomOrBedLabel = currentRoom
       ? `${roomName} - ${isAr ? `سرير ${selectedBedNumber}` : `Bed ${selectedBedNumber}`}`
@@ -206,7 +143,8 @@ export function BookAppointmentModal({
       packageId: patientActivePackage?.id,
       date,
       startTime: time,
-      duration: 45,
+      duration,
+      price: Number(price),
       roomOrBed: roomOrBedLabel,
       roomId: currentRoom?.id,
       bedNumber: selectedBedNumber,
@@ -217,6 +155,7 @@ export function BookAppointmentModal({
     setIsSuccess(true);
     setTimeout(() => {
       setIsSuccess(false);
+      setIsSubmitting(false);
       onClose();
     }, 1200);
   };
@@ -410,8 +349,8 @@ export function BookAppointmentModal({
               </select>
             </div>
 
-            {/* Date & Time */}
-            <div className="grid grid-cols-2 gap-3">
+            {/* Date, Time & Duration */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <div>
                 <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1 flex items-center gap-1">
                   <Calendar className="w-3.5 h-3.5 text-blue-600" />
@@ -445,6 +384,48 @@ export function BookAppointmentModal({
                   className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 text-slate-900 dark:text-white font-mono"
                 />
               </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1 flex items-center gap-1">
+                  <Clock className="w-3.5 h-3.5 text-teal-600" />
+                  <span>{isAr ? 'المدة (بالدقائق) *' : 'Duration (Mins) *'}</span>
+                </label>
+                <input
+                  type="number"
+                  required
+                  min={15}
+                  max={180}
+                  step={15}
+                  value={duration}
+                  onChange={(e) => {
+                    setDuration(Number(e.target.value));
+                    setConflictError(null);
+                  }}
+                  className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 text-slate-900 dark:text-white font-mono font-bold"
+                />
+              </div>
+            </div>
+
+            {/* Required Price Field (EGP) per appointment (Rule 4) */}
+            <div>
+              <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1 flex items-center justify-between">
+                <span className="flex items-center gap-1">
+                  <CreditCard className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>{isAr ? 'سعر الجلسة (ج.م) *' : 'Session Price (EGP) *'}</span>
+                </span>
+                <span className="text-[10px] text-slate-400">
+                  {isAr ? 'إدخال يدوي بواسطة الاستقبال' : 'Entered by receptionist'}
+                </span>
+              </label>
+              <input
+                type="number"
+                required
+                min={0}
+                value={price}
+                onChange={(e) => setPrice(e.target.value === '' ? '' : Number(e.target.value))}
+                placeholder="e.g. 350"
+                className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 text-slate-900 dark:text-white font-mono font-bold"
+              />
             </div>
 
             {/* Dynamic Room & Bed Selection */}
@@ -504,15 +485,15 @@ export function BookAppointmentModal({
               </button>
               <button
                 type="submit"
-                disabled={patients.length === 0 || Boolean(currentConflict)}
+                disabled={patients.length === 0 || Boolean(currentConflict) || isSubmitting}
                 className={`px-5 py-2 rounded-xl text-white font-bold transition flex items-center space-x-1.5 rtl:space-x-reverse shadow-md ${
-                  currentConflict
+                  currentConflict || isSubmitting
                     ? 'bg-rose-400 cursor-not-allowed opacity-70'
                     : 'bg-blue-600 hover:bg-blue-700 disabled:opacity-50'
                 }`}
               >
                 <Check className="w-4 h-4" />
-                <span>{isAr ? 'تأكيد الحجز' : 'Confirm Booking'}</span>
+                <span>{isSubmitting ? (isAr ? 'جاري الحجز...' : 'Booking...') : (isAr ? 'تأكيد الحجز' : 'Confirm Booking')}</span>
               </button>
             </div>
           </form>

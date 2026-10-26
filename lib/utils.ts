@@ -47,6 +47,32 @@ export function formatTime12h(time24: string, language: 'en' | 'ar' = 'en'): str
  * Clean Egyptian phone number for WhatsApp wa.me links
  * Handles 010..., 011..., 012..., 015... and +20...
  */
+/**
+ * Validate Egyptian mobile phone number format:
+ * Pattern: /^(\+20|0)?1[0125][0-9]{8}$/
+ */
+export function validateEgyptianPhone(phone: string): boolean {
+  if (!phone) return false;
+  const cleaned = phone.replace(/[\s\-\(\)]/g, '');
+  return /^(\+20|0)?1[0125][0-9]{8}$/.test(cleaned);
+}
+
+/**
+ * Normalize Egyptian phone number before comparing:
+ * Strip spaces, symbols, and treat +20, 20, leading 0, and direct 1... as identical 01XXXXXXXXX
+ */
+export function normalizeEgyptianPhone(phone: string): string {
+  if (!phone) return '';
+  let digits = phone.replace(/\D/g, '');
+  if (digits.startsWith('20')) {
+    digits = digits.slice(2);
+  }
+  if (!digits.startsWith('0') && digits.length === 10) {
+    digits = '0' + digits;
+  }
+  return digits;
+}
+
 export function cleanEgyptianPhone(phone: string): string {
   const digitsOnly = phone.replace(/\D/g, '');
   if (digitsOnly.startsWith('20')) {

@@ -708,6 +708,9 @@ export function PatientDirectory({ onOpenIntakeModal }: PatientDirectoryProps) {
           isOpen={true}
           onClose={() => setSelectedPatientForEdit(null)}
           patient={selectedPatientForEdit}
+          onOpenPatientFile={(existing) => {
+            setSelectedPatientForEdit(existing);
+          }}
         />
       )}
 

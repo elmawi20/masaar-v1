@@ -19,6 +19,7 @@ import {
   AuditLog,
   ClinicSecurityConfig,
   ClinicNotification,
+  SessionType,
 } from '@/types';
 import {
   INITIAL_CLINIC,
@@ -78,6 +79,17 @@ interface ClinicContextType {
   // Package Actions
   addPackage: (data: Omit<TreatmentPackage, 'id' | 'clinicId'>) => TreatmentPackage;
   updatePackage: (id: string, updates: Partial<TreatmentPackage>) => void;
+  extendPackage: (packageId: string, additionalDays: number, reason: string) => { success: boolean; error?: string };
+  recordPayment: (params: {
+    patientId: string;
+    amount: number;
+    paymentMethod: PaymentMethod;
+    packageId?: string;
+    appointmentId?: string;
+    receiptImage?: string;
+    notes?: string;
+  }) => { success: boolean; error?: string; receipt?: PaymentReceipt };
+  voidReceipt: (receiptId: string, reason: string) => { success: boolean; error?: string };
   recordPackagePayment: (
     packageId: string,
     amount: number,
@@ -91,7 +103,14 @@ interface ClinicContextType {
   updateAppointmentStatus: (
     id: string,
     status: AppointmentStatus,
-    metadata?: { doctorNotes?: string; attachments?: string[] }
+    metadata?: {
+      doctorNotes?: string;
+      attachments?: string[];
+      cancellationReason?: string;
+      cancelledAt?: string;
+      noShowReason?: string;
+      markedNoShowAt?: string;
+    }
   ) => void;
   checkInAppointment: (id: string) => { isLate: boolean; delayMinutes: number };
   rescheduleAppointment: (
@@ -100,8 +119,29 @@ interface ClinicContextType {
     newDate?: string,
     newRoom?: string,
     newRoomId?: string,
-    newBedNumber?: number
-  ) => void;
+    newBedNumber?: number,
+    newDuration?: number,
+    newPrice?: number
+  ) => { success: boolean; error?: string };
+  updateAppointmentPrice: (appointmentId: string, newPrice: number) => { success: boolean; error?: string };
+  getAppointmentPaymentStatus: (appointmentId: string) => {
+    status: 'paid' | 'partial' | 'unpaid' | 'package';
+    totalPaid: number;
+    price: number;
+    balanceDue: number;
+  };
+  checkAppointmentConflict: (params: {
+    appointmentId?: string;
+    patientId: string;
+    physioId: string;
+    date: string;
+    startTime: string;
+    duration?: number;
+    roomId?: string;
+    bedNumber?: number;
+    sessionType?: SessionType;
+    packageId?: string;
+  }) => { hasConflict: boolean; reason?: string };
   deleteAppointment: (id: string) => void;
 
   // Real-Time Notifications
@@ -131,7 +171,7 @@ interface ClinicContextType {
   addExpense: (expense: Omit<ClinicExpense, 'id' | 'clinicId' | 'createdAt' | 'loggedBy' | 'loggedById'>) => ClinicExpense;
   updateExpense: (id: string, updates: Partial<ClinicExpense>, reason?: string) => void;
   deleteExpense: (id: string) => void;
-  logAuditAction: (action: string, details: string) => void;
+  logAuditAction: (action: string, details: string, before?: any, after?: any) => void;
 
   // Helpers & Stats
   resetDemoData: () => void;
@@ -436,10 +476,19 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
       createdAt: new Date().toISOString(),
     };
     setPatients((prev) => [newPatient, ...prev]);
+
+    logAuditAction(
+      'patient_create',
+      `Created patient ${newPatient.fullName} (${newPatient.id})`,
+      null,
+      newPatient
+    );
+
     return newPatient;
   };
 
   const updatePatient = (id: string, updates: Partial<Patient>) => {
+    const existing = patients.find((p) => p.id === id);
     const cleanUpdates = { ...updates };
     if (cleanUpdates.phone) {
       cleanUpdates.phone = formatEgyptianPhone(cleanUpdates.phone) || cleanUpdates.phone;
@@ -451,6 +500,15 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
     setPatients((prev) =>
       prev.map((pat) => (pat.id === id ? { ...pat, ...cleanUpdates } : pat))
     );
+
+    if (existing) {
+      logAuditAction(
+        'patient_edit',
+        `Updated patient ${existing.fullName} (${id})`,
+        existing,
+        { ...existing, ...cleanUpdates }
+      );
+    }
   };
 
   const updatePatientDiagnosis = (id: string, diagnosis: string) => {
@@ -487,14 +545,70 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
     setAdminPasswordState(pwd);
   };
 
+  // Sequential Receipt Number Generator (INV-YYYY-00001)
+  const generateReceiptNumber = (): string => {
+    const year = new Date().getFullYear();
+    const prefix = `INV-${year}-`;
+    const matching = paymentReceipts.filter(
+      (r) => r.receiptNumber && r.receiptNumber.startsWith(prefix)
+    );
+    let maxSeq = 0;
+    matching.forEach((r) => {
+      const num = parseInt((r.receiptNumber || '').replace(prefix, ''), 10);
+      if (!isNaN(num) && num > maxSeq) maxSeq = num;
+    });
+    const nextSeq = String(maxSeq + 1).padStart(5, '0');
+    return `${prefix}${nextSeq}`;
+  };
+
+  // Dynamic Packages with amountPaid and balanceDue calculated from receipts
+  const computedPackages = React.useMemo(() => {
+    const today = new Date().toISOString().split('T')[0];
+    return packages.map((pkg) => {
+      const pkgReceipts = paymentReceipts.filter(
+        (r) => r.packageId === pkg.id && !r.isVoided
+      );
+      const amountPaid = pkgReceipts.reduce((sum, r) => sum + r.amount, 0);
+      const balanceDue = Math.max(0, pkg.totalPrice - amountPaid);
+
+      let status = pkg.status;
+      if (pkg.expiryDate && today > pkg.expiryDate && status === 'active') {
+        status = 'forfeited';
+      } else if (balanceDue === 0 && pkg.completedSessions >= pkg.totalSessions) {
+        status = 'completed';
+      }
+
+      return {
+        ...pkg,
+        amountPaid,
+        balanceDue,
+        status,
+        receipts: pkgReceipts,
+      };
+    });
+  }, [packages, paymentReceipts]);
+
   // Package Actions
   const addPackage = (data: Omit<TreatmentPackage, 'id' | 'clinicId'>): TreatmentPackage => {
+    const purchaseDate = data.purchaseDate || new Date().toISOString().split('T')[0];
+    const expiryDate = data.expiryDate || new Date(new Date(purchaseDate).getTime() + 60 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
     const newPackage: TreatmentPackage = {
       ...data,
+      purchaseDate,
+      expiryDate,
       id: `pkg-${Date.now().toString().slice(-6)}`,
       clinicId: clinic.id,
     };
     setPackages((prev) => [newPackage, ...prev]);
+
+    logAuditAction(
+      'package_create',
+      `Created package ${newPackage.packageName} (${newPackage.totalPrice} EGP, ${newPackage.totalSessions} sessions) for patient ${newPackage.patientId}`,
+      null,
+      newPackage
+    );
+
     return newPackage;
   };
 
@@ -502,6 +616,154 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
     setPackages((prev) =>
       prev.map((pkg) => (pkg.id === id ? { ...pkg, ...updates } : pkg))
     );
+  };
+
+  // Admin-only "Extend package" action with required reason, logged to audit
+  const extendPackage = (
+    packageId: string,
+    additionalDays: number,
+    reason: string
+  ): { success: boolean; error?: string } => {
+    if (currentRole !== 'admin' && currentRole !== 'co_admin') {
+      return {
+        success: false,
+        error: language === 'ar' ? 'صلاحية تمديد الباقات للمدير فقط' : 'Only clinic admins can extend packages',
+      };
+    }
+
+    if (!reason || !reason.trim()) {
+      return {
+        success: false,
+        error: language === 'ar' ? 'يرجى كتابة سبب تمديد الباقة' : 'A reason is required to extend a package',
+      };
+    }
+
+    const targetPkg = packages.find((p) => p.id === packageId);
+    if (!targetPkg) {
+      return {
+        success: false,
+        error: language === 'ar' ? 'الباقة غير موجودة' : 'Package not found',
+      };
+    }
+
+    const currentExp = new Date(targetPkg.expiryDate || targetPkg.startDate);
+    const newExpDate = new Date(currentExp.getTime() + additionalDays * 24 * 60 * 60 * 1000)
+      .toISOString()
+      .split('T')[0];
+
+    const updatedPkg: TreatmentPackage = {
+      ...targetPkg,
+      expiryDate: newExpDate,
+      status: 'active', // Restore if it was expired/forfeited
+    };
+
+    setPackages((prev) =>
+      prev.map((p) => (p.id === packageId ? updatedPkg : p))
+    );
+
+    logAuditAction(
+      'package_extension',
+      `Extended package ${targetPkg.packageName} (${packageId}) by ${additionalDays} days to ${newExpDate}. Reason: ${reason.trim()}`,
+      { expiryDate: targetPkg.expiryDate, status: targetPkg.status },
+      { expiryDate: newExpDate, status: 'active', reason: reason.trim() }
+    );
+
+    return { success: true };
+  };
+
+  // Flexible Payment Recording (Package, Appointment, or Direct Patient)
+  const recordPayment = (params: {
+    patientId: string;
+    amount: number;
+    paymentMethod: PaymentMethod;
+    packageId?: string;
+    appointmentId?: string;
+    receiptImage?: string;
+    notes?: string;
+  }): { success: boolean; error?: string; receipt?: PaymentReceipt } => {
+    const { patientId, amount, paymentMethod, packageId, appointmentId, receiptImage, notes } = params;
+
+    if (amount <= 0) {
+      return {
+        success: false,
+        error: language === 'ar' ? 'مبلغ التحصيل يجب أن يكون أكبر من صفر' : 'Payment amount must be greater than zero',
+      };
+    }
+
+    // If linked to package, block payment greater than remaining balance
+    if (packageId) {
+      const pkg = packages.find((p) => p.id === packageId);
+      if (!pkg) {
+        return {
+          success: false,
+          error: language === 'ar' ? 'الباقة غير موجودة' : 'Package not found',
+        };
+      }
+      const currentPaid = paymentReceipts
+        .filter((r) => r.packageId === packageId && !r.isVoided)
+        .reduce((sum, r) => sum + r.amount, 0);
+      const remainingBalance = Math.max(0, pkg.totalPrice - currentPaid);
+      if (amount > remainingBalance) {
+        return {
+          success: false,
+          error: language === 'ar'
+            ? `قيمة الدفعة (${amount} ج.م) أكبر من الرصيد المتبقي للباقة (${remainingBalance} ج.م)`
+            : `Payment amount (${amount} EGP) exceeds remaining package balance (${remainingBalance} EGP)`,
+        };
+      }
+    }
+
+    // If linked to appointment, block payment greater than remaining balance
+    if (appointmentId) {
+      const appt = appointments.find((a) => a.id === appointmentId);
+      if (!appt) {
+        return {
+          success: false,
+          error: language === 'ar' ? 'الموعد غير موجود' : 'Appointment not found',
+        };
+      }
+      const currentPaid = paymentReceipts
+        .filter((r) => r.appointmentId === appointmentId && !r.isVoided)
+        .reduce((sum, r) => sum + r.amount, 0);
+      const apptPrice = appt.price || 0;
+      const remainingBalance = Math.max(0, apptPrice - currentPaid);
+      if (amount > remainingBalance) {
+        return {
+          success: false,
+          error: language === 'ar'
+            ? `قيمة الدفعة (${amount} ج.م) أكبر من الرصيد المتبقي للموعد (${remainingBalance} ج.م)`
+            : `Payment amount (${amount} EGP) exceeds remaining appointment balance (${remainingBalance} EGP)`,
+        };
+      }
+    }
+
+    const receiptNumber = generateReceiptNumber();
+    const activeUser = users.find((u) => u.id === currentUserId);
+    const newReceipt: PaymentReceipt = {
+      id: `rcpt-${Date.now().toString().slice(-6)}`,
+      clinicId: clinic.id,
+      receiptNumber,
+      packageId,
+      appointmentId,
+      patientId,
+      amount,
+      paymentMethod,
+      date: new Date().toISOString(),
+      receiptImage,
+      notes,
+      collectedBy: activeUser?.name || 'Reception Desk',
+    };
+
+    setPaymentReceipts((prev) => [newReceipt, ...prev]);
+
+    logAuditAction(
+      'payment',
+      `Recorded payment of ${amount} EGP via ${paymentMethod.toUpperCase()} (Receipt: ${receiptNumber}) for patient ${patientId}`,
+      null,
+      newReceipt
+    );
+
+    return { success: true, receipt: newReceipt };
   };
 
   const recordPackagePayment = (
@@ -513,63 +775,233 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
   ) => {
     const pkg = packages.find((p) => p.id === packageId);
     if (!pkg) return;
-
-    const newAmountPaid = pkg.amountPaid + amount;
-    const newBalanceDue = Math.max(0, pkg.totalPrice - newAmountPaid);
-    const newStatus =
-      newBalanceDue === 0 && pkg.completedSessions >= pkg.totalSessions
-        ? 'completed'
-        : pkg.status;
-
-    const newReceipt: PaymentReceipt = {
-      id: `rcpt-${Date.now().toString().slice(-6)}`,
-      clinicId: clinic.id,
-      packageId,
+    recordPayment({
       patientId: pkg.patientId,
       amount,
       paymentMethod: method,
-      date: new Date().toISOString(),
+      packageId,
       receiptImage,
       notes,
-      collectedBy: users.find((u) => u.id === currentUserId)?.name || 'Reception Desk',
+    });
+  };
+
+  // Admin-only "Void receipt" with required reason, logged to audit
+  const voidReceipt = (
+    receiptId: string,
+    reason: string
+  ): { success: boolean; error?: string } => {
+    if (currentRole !== 'admin' && currentRole !== 'co_admin') {
+      return {
+        success: false,
+        error: language === 'ar' ? 'صلاحية إلغاء الإيصالات للمدير فقط' : 'Only clinic admins can void receipts',
+      };
+    }
+
+    if (!reason || !reason.trim()) {
+      return {
+        success: false,
+        error: language === 'ar' ? 'يرجى كتابة سبب إلغاء الإيصال' : 'A reason is required to void a receipt',
+      };
+    }
+
+    const targetReceipt = paymentReceipts.find((r) => r.id === receiptId);
+    if (!targetReceipt) {
+      return {
+        success: false,
+        error: language === 'ar' ? 'الإيصال غير موجود' : 'Receipt not found',
+      };
+    }
+
+    if (targetReceipt.isVoided) {
+      return {
+        success: false,
+        error: language === 'ar' ? 'الإيصال ملغى مسبقاً' : 'Receipt is already voided',
+      };
+    }
+
+    const activeUser = users.find((u) => u.id === currentUserId);
+    const updatedReceipt: PaymentReceipt = {
+      ...targetReceipt,
+      isVoided: true,
+      voidedAt: new Date().toISOString(),
+      voidedBy: activeUser?.name || 'Admin',
+      voidReason: reason.trim(),
     };
 
-    setPaymentReceipts((prev) => [newReceipt, ...prev]);
-
-    setPackages((prev) =>
-      prev.map((p) => {
-        if (p.id === packageId) {
-          return {
-            ...p,
-            amountPaid: newAmountPaid,
-            balanceDue: newBalanceDue,
-            status: newStatus,
-            receipts: [newReceipt, ...(p.receipts || [])],
-          };
-        }
-        return p;
-      })
+    setPaymentReceipts((prev) =>
+      prev.map((r) => (r.id === receiptId ? updatedReceipt : r))
     );
+
+    logAuditAction(
+      'void',
+      `Voided receipt ${targetReceipt.receiptNumber || targetReceipt.id} (${targetReceipt.amount} EGP). Reason: ${reason.trim()}`,
+      targetReceipt,
+      updatedReceipt
+    );
+
+    return { success: true };
   };
 
   // Appointment Actions
-  const addAppointment = (data: Omit<Appointment, 'id' | 'clinicId'>): Appointment => {
-    // Enforce 1 session per day per category (1 Physio + 1 Nutrition allowed)
-    const existingConflict = appointments.find((a) => {
-      if (a.date !== data.date || a.status === 'cancelled' || a.status === 'no-show') return false;
-      if (a.patientId !== data.patientId) return false;
-      const isNutA = a.sessionType === 'nutrition';
-      const isNutB = data.sessionType === 'nutrition';
-      return isNutA === isNutB;
+  const checkAppointmentConflict = (params: {
+    appointmentId?: string;
+    patientId: string;
+    physioId: string;
+    date: string;
+    startTime: string;
+    duration?: number;
+    roomId?: string;
+    bedNumber?: number;
+    sessionType?: SessionType;
+    packageId?: string;
+  }): { hasConflict: boolean; reason?: string } => {
+    const { appointmentId, patientId, physioId, date, startTime, duration = 45, roomId, bedNumber, sessionType, packageId } = params;
+    if (!date || !startTime) return { hasConflict: false };
+
+    // 0. Check package expiration date (Rule 6: Block booking package sessions dated after expiryDate)
+    if (packageId) {
+      const pkg = packages.find((p) => p.id === packageId);
+      if (pkg && pkg.expiryDate && date > pkg.expiryDate) {
+        const reason = language === 'ar'
+          ? `⚠️ باقة العلاج (${pkg.packageName}) منتهية الصلاحية بتاريخ ${pkg.expiryDate}. لا يمكن حجز جلسات بعد تاريخ الانتهاء.`
+          : `⚠️ Treatment package (${pkg.packageName}) expired on ${pkg.expiryDate}. Sessions cannot be booked after expiry date.`;
+        return { hasConflict: true, reason };
+      }
+    }
+
+    const timeToMinutes = (t: string) => {
+      const [h, m] = t.split(':').map(Number);
+      return (h || 0) * 60 + (m || 0);
+    };
+
+    const newStart = timeToMinutes(startTime);
+    const newEnd = newStart + duration;
+
+    // 1. Daily limit rule: allow 1 assessment + 1 physio session + 1 nutrition session per patient per day
+    const getCategory = (st?: string): 'assessment' | 'physio' | 'nutrition' => {
+      if (st === 'consultant_assessment' || st === 'assessment') return 'assessment';
+      if (st === 'nutrition') return 'nutrition';
+      return 'physio';
+    };
+
+    const targetCategory = getCategory(sessionType);
+
+    const sameDaySession = appointments.find((a) => {
+      if (appointmentId && a.id === appointmentId) return false;
+      if (a.date !== date) return false;
+      if (a.status === 'cancelled' || a.status === 'no-show' || a.status === 'waitlisted') return false;
+      if (a.patientId !== patientId) return false;
+
+      return getCategory(a.sessionType) === targetCategory;
     });
 
-    if (existingConflict) {
-      console.warn(`Blocked duplicate booking for patient ${data.patientId} on ${data.date}`);
-      return existingConflict;
+    if (sameDaySession) {
+      const catLabel =
+        targetCategory === 'assessment'
+          ? (language === 'ar' ? 'كشف واستشارة استشاري' : 'Initial Assessment')
+          : targetCategory === 'nutrition'
+          ? (language === 'ar' ? 'تغذية علاجية' : 'Nutrition Session')
+          : (language === 'ar' ? 'علاج طبيعي' : 'Physiotherapy Session');
+
+      const reason = language === 'ar'
+        ? `⚠️ الحد اليومي للجلسات: المريض لديه بالفعل جلسة (${catLabel}) في نفس اليوم (${date}). النظام يسمح بجلسة واحدة كشف + جلسة واحدة علاج طبيعي + جلسة واحدة تغذية يومياً.`
+        : `⚠️ Daily Limit: Patient already has a (${catLabel}) on ${date}. Clinic policy allows 1 assessment + 1 physio + 1 nutrition session per day.`;
+      return { hasConflict: true, reason };
+    }
+
+    // 2. Doctor conflict: Real overlap (newStart < existingEnd && newEnd > existingStart)
+    const doctorConflict = appointments.find((a) => {
+      if (appointmentId && a.id === appointmentId) return false;
+      if (a.date !== date) return false;
+      if (a.status === 'cancelled' || a.status === 'no-show' || a.status === 'waitlisted') return false;
+      if (a.physioId !== physioId) return false;
+
+      const existingStart = timeToMinutes(a.startTime);
+      const existingEnd = existingStart + (a.duration || 45);
+
+      return newStart < existingEnd && newEnd > existingStart;
+    });
+
+    if (doctorConflict) {
+      const doc = users.find((u) => u.id === physioId);
+      const pat = patients.find((p) => p.id === doctorConflict.patientId);
+      const reason = language === 'ar'
+        ? `⚠️ تعارض في جدول الطبيب: د. ${doc?.name || 'المعالج'} لديه جلسة أخرى في هذا التوقيت (${doctorConflict.startTime}) مع المريض (${pat?.fullName || 'آخر'}).`
+        : `⚠️ Doctor Conflict: Dr. ${doc?.name || 'Physician'} is already booked at ${doctorConflict.startTime} with ${pat?.fullName || 'another patient'}.`;
+      return { hasConflict: true, reason };
+    }
+
+    // 3. Room & Bed Capacity Conflict
+    if (roomId) {
+      const room = rooms.find((r) => r.id === roomId);
+      const roomApts = appointments.filter((a) => {
+        if (appointmentId && a.id === appointmentId) return false;
+        if (a.date !== date) return false;
+        if (a.status === 'cancelled' || a.status === 'no-show' || a.status === 'waitlisted') return false;
+
+        const isSameRoom =
+          (a.roomId && a.roomId === roomId) ||
+          (a.roomOrBed && room && (a.roomOrBed.includes(room.nameEn) || a.roomOrBed.includes(room.nameAr)));
+        if (!isSameRoom) return false;
+
+        const existingStart = timeToMinutes(a.startTime);
+        const existingEnd = existingStart + (a.duration || 45);
+        return newStart < existingEnd && newEnd > existingStart;
+      });
+
+      // Bed conflict
+      if (bedNumber) {
+        const bedConflict = roomApts.find(
+          (a) => a.bedNumber === bedNumber || (a.roomOrBed && (a.roomOrBed.includes(`Bed ${bedNumber}`) || a.roomOrBed.includes(`سرير ${bedNumber}`)))
+        );
+        if (bedConflict) {
+          const reason = language === 'ar'
+            ? `⚠️ السرير محجوز: (سرير ${bedNumber}) في (${room?.nameAr || room?.nameEn || 'الغرفة'}) محجوز بالفعل في هذا التوقيت.`
+            : `⚠️ Bed Occupied: Bed ${bedNumber} in ${room?.nameEn || 'Room'} is already occupied at this time.`;
+          return { hasConflict: true, reason };
+        }
+      }
+
+      // Room capacity limit
+      if (room && roomApts.length >= room.bedCount) {
+        const reason = language === 'ar'
+          ? `⚠️ الغرفة مكتملة: (${room.nameAr || room.nameEn}) مشغولة بالكامل بطاقتها القصوى (${room.bedCount} أسِرّة) في هذا التوقيت.`
+          : `⚠️ Room Full: ${room.nameEn} is at max capacity (${room.bedCount} beds) at this time.`;
+        return { hasConflict: true, reason };
+      }
+    }
+
+    return { hasConflict: false };
+  };
+
+  const addAppointment = (data: Omit<Appointment, 'id' | 'clinicId'>): Appointment => {
+    // Enforce centralized availability, daily limit, and package expiry checks
+    const conflict = checkAppointmentConflict({
+      patientId: data.patientId,
+      physioId: data.physioId,
+      date: data.date,
+      startTime: data.startTime,
+      duration: data.duration,
+      roomId: data.roomId,
+      bedNumber: data.bedNumber,
+      sessionType: data.sessionType,
+      packageId: data.packageId,
+    });
+
+    if (conflict.hasConflict) {
+      console.warn(`Blocked booking due to conflict: ${conflict.reason}`);
+      const dummyConflict: Appointment = {
+        ...data,
+        price: data.price !== undefined ? data.price : 350,
+        id: `conflict-${Date.now()}`,
+        clinicId: clinic.id,
+      };
+      return dummyConflict;
     }
 
     const newApt: Appointment = {
       ...data,
+      price: data.price !== undefined ? data.price : 350,
       id: `apt-${Date.now().toString().slice(-6)}`,
       clinicId: clinic.id,
     };
@@ -596,18 +1028,50 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
 
     setNotifications((prev) => [bookNotif, ...prev.slice(0, 19)]);
 
+    logAuditAction(
+      'booking',
+      `Booked appointment ${newApt.id} for patient ${patient?.fullName || data.patientId} on ${newApt.date} at ${newApt.startTime} (Price: ${newApt.price} EGP)`,
+      null,
+      newApt
+    );
+
     return newApt;
   };
 
   const updateAppointmentStatus = (
     id: string,
     newStatus: AppointmentStatus,
-    metadata?: { doctorNotes?: string; attachments?: string[] }
+    metadata?: {
+      doctorNotes?: string;
+      attachments?: string[];
+      cancellationReason?: string;
+      cancelledAt?: string;
+      noShowReason?: string;
+      markedNoShowAt?: string;
+    }
   ) => {
     const apt = appointments.find((a) => a.id === id);
     if (!apt) return;
 
     const oldStatus = apt.status;
+
+    // Status transition guards: block invalid moves
+    if (oldStatus === 'cancelled' && newStatus === 'completed') {
+      console.warn('Blocked invalid status transition: cancelled -> completed');
+      return;
+    }
+    if (oldStatus === 'no-show' && newStatus === 'completed') {
+      console.warn('Blocked invalid status transition: no-show -> completed');
+      return;
+    }
+    if (oldStatus === 'completed' && newStatus === 'no-show') {
+      console.warn('Blocked invalid status transition: completed -> no-show');
+      return;
+    }
+
+    const cancelledAt = newStatus === 'cancelled' ? (metadata?.cancelledAt || new Date().toISOString()) : apt.cancelledAt;
+    const markedNoShowAt = newStatus === 'no-show' ? (metadata?.markedNoShowAt || new Date().toISOString()) : apt.markedNoShowAt;
+
     setAppointments((prev) =>
       prev.map((a) =>
         a.id === id
@@ -616,12 +1080,33 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
               status: newStatus,
               ...(metadata?.doctorNotes !== undefined ? { doctorNotes: metadata.doctorNotes } : {}),
               ...(metadata?.attachments ? { attachments: metadata.attachments } : {}),
+              ...(metadata?.cancellationReason ? { cancellationReason: metadata.cancellationReason } : {}),
+              cancelledAt,
+              ...(metadata?.noShowReason ? { noShowReason: metadata.noShowReason } : {}),
+              markedNoShowAt,
             }
           : a
       )
     );
 
-    // 1. If moving to 'completed' -> Deduct 1 session from package
+    // Audit logs for cancellation and no-show
+    if (newStatus === 'cancelled') {
+      logAuditAction(
+        'cancel',
+        `Cancelled appointment ${id}. Reason: ${metadata?.cancellationReason || 'N/A'}`,
+        apt,
+        { ...apt, status: 'cancelled', ...metadata, cancelledAt }
+      );
+    } else if (newStatus === 'no-show') {
+      logAuditAction(
+        'no_show',
+        `Marked appointment ${id} as no-show. Reason: ${metadata?.noShowReason || 'N/A'}`,
+        apt,
+        { ...apt, status: 'no-show', ...metadata, markedNoShowAt }
+      );
+    }
+
+    // 1. If moving to 'completed' -> Deduct 1 session from package (Only when completed by clinical staff!)
     if (newStatus === 'completed' && oldStatus !== 'completed' && apt.packageId) {
       setPackages((prevPackages) =>
         prevPackages.map((pkg) => {
@@ -663,8 +1148,30 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
     const patient = patients.find((p) => p.id === apt.patientId);
     const doctor = users.find((u) => u.id === apt.physioId);
 
-    const statusLabelEn = newStatus === 'completed' ? 'Marked Done / Completed' : newStatus === 'no-show' ? 'Marked No-Show' : newStatus === 'cancelled' ? 'Cancelled' : 'Scheduled';
-    const statusLabelAr = newStatus === 'completed' ? 'تم إنهاء الجلسة واحتسابها' : newStatus === 'no-show' ? 'سُجل كغائب لم يحضر' : newStatus === 'cancelled' ? 'تم إلغاء الموعد' : 'مجدول';
+    const statusLabelEn =
+      newStatus === 'completed'
+        ? 'Marked Done / Completed'
+        : newStatus === 'no-show'
+        ? 'Marked No-Show'
+        : newStatus === 'cancelled'
+        ? 'Cancelled'
+        : newStatus === 'arrived'
+        ? 'Arrived / In Waiting'
+        : newStatus === 'waitlisted'
+        ? 'Moved to Waitlist'
+        : 'Scheduled';
+    const statusLabelAr =
+      newStatus === 'completed'
+        ? 'تم إنهاء الجلسة واحتسابها'
+        : newStatus === 'no-show'
+        ? 'سُجل كغائب لم يحضر'
+        : newStatus === 'cancelled'
+        ? 'تم إلغاء الموعد'
+        : newStatus === 'arrived'
+        ? 'حضر / في الانتظار'
+        : newStatus === 'waitlisted'
+        ? 'في قائمة الانتظار'
+        : 'مجدول';
 
     const notif: ClinicNotification = {
       id: `notif-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -692,7 +1199,7 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
     setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
   };
 
-  // Check-In Appointment Action with Late Arrival Calculation & Real-Time Alerts
+  // Check-In Appointment Action with Late Arrival Calculation: sets status 'arrived' only!
   const checkInAppointment = (id: string): { isLate: boolean; delayMinutes: number } => {
     const apt = appointments.find((a) => a.id === id);
     if (!apt) return { isLate: false, delayMinutes: 0 };
@@ -713,13 +1220,13 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
     const earlyMinutes = isEarly ? Math.abs(diff) : 0;
     const arrivalTimeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 
-    // Update appointment
+    // Update appointment: set status to 'arrived' only. Do NOT mark completed and do NOT deduct package session!
     setAppointments((prev) =>
       prev.map((a) => {
         if (a.id === id) {
           return {
             ...a,
-            status: 'completed',
+            status: 'arrived',
             arrivedAt: arrivalTimeStr,
             delayMinutes,
             earlyMinutes,
@@ -729,26 +1236,7 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
       })
     );
 
-    // Deduct session from package if applicable
-    if (apt.packageId) {
-      setPackages((prevPackages) =>
-        prevPackages.map((pkg) => {
-          if (pkg.id === apt.packageId && apt.status !== 'completed') {
-            const updatedCompleted = pkg.completedSessions + 1;
-            const updatedRemaining = Math.max(0, pkg.totalSessions - updatedCompleted);
-            return {
-              ...pkg,
-              completedSessions: updatedCompleted,
-              remainingSessions: updatedRemaining,
-              status: updatedRemaining === 0 ? 'completed' : pkg.status,
-            };
-          }
-          return pkg;
-        })
-      );
-    }
-
-    // Push real-time notification to doctor and admin
+    // Push real-time arrival notification to doctor and admin
     const newNotif: ClinicNotification = {
       id: `notif-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       type: isLate ? 'late_arrival' : 'arrival',
@@ -775,23 +1263,69 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
 
     setNotifications((prev) => [newNotif, ...prev.slice(0, 19)]);
 
+    logAuditAction(
+      'check_in',
+      `Checked in patient for appointment ${id} at ${arrivalTimeStr}`,
+      apt,
+      { ...apt, status: 'arrived', arrivedAt: arrivalTimeStr, delayMinutes, earlyMinutes }
+    );
+
     return { isLate, delayMinutes };
   };
 
-  // Inline Reschedule Action (Synchronizes roomId, bedNumber, roomOrBed cleanly)
+  // Inline Reschedule Action (checks conflicts, price permissions, package expiry, and synchronizes cleanly)
   const rescheduleAppointment = (
     id: string,
     newTime: string,
     newDate?: string,
     newRoom?: string,
     newRoomId?: string,
-    newBedNumber?: number
-  ) => {
+    newBedNumber?: number,
+    newDuration?: number,
+    newPrice?: number
+  ): { success: boolean; error?: string } => {
     const apt = appointments.find((a) => a.id === id);
-    if (!apt) return;
+    if (!apt) return { success: false, error: 'Appointment not found' };
+
+    const targetDate = newDate || apt.date;
+    const targetRoomId = newRoomId !== undefined ? newRoomId : apt.roomId;
+    const targetBedNumber = newBedNumber !== undefined ? newBedNumber : apt.bedNumber;
+    const targetDuration = newDuration !== undefined ? newDuration : (apt.duration || 45);
+
+    // Price change permission check: after payment exists, only admin can change price (Rule 4)
+    if (newPrice !== undefined && newPrice !== apt.price) {
+      const hasPayment = paymentReceipts.some((r) => r.appointmentId === id && !r.isVoided);
+      if (hasPayment && currentRole !== 'admin' && currentRole !== 'co_admin') {
+        return {
+          success: false,
+          error: language === 'ar'
+            ? 'لا يمكن تعديل سعر الجلسة بعد تسجيل دفعة مالية إلا بواسطة المدير'
+            : 'Only clinic admin can change appointment price after a payment exists',
+        };
+      }
+    }
+
+    const conflict = checkAppointmentConflict({
+      appointmentId: id,
+      patientId: apt.patientId,
+      physioId: apt.physioId,
+      date: targetDate,
+      startTime: newTime,
+      duration: targetDuration,
+      roomId: targetRoomId,
+      bedNumber: targetBedNumber,
+      sessionType: apt.sessionType,
+      packageId: apt.packageId,
+    });
+
+    if (conflict.hasConflict) {
+      console.warn(`Blocked reschedule: ${conflict.reason}`);
+      return { success: false, error: conflict.reason };
+    }
 
     const patient = patients.find((p) => p.id === apt.patientId);
     const doctor = users.find((u) => u.id === apt.physioId);
+    const updatedPrice = newPrice !== undefined ? newPrice : apt.price;
 
     setAppointments((prev) =>
       prev.map((a) => {
@@ -799,11 +1333,13 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
           return {
             ...a,
             startTime: newTime,
-            date: newDate || a.date,
+            date: targetDate,
+            duration: targetDuration,
+            price: updatedPrice,
             roomOrBed: newRoom || a.roomOrBed,
-            roomId: newRoomId !== undefined ? newRoomId : a.roomId,
-            bedNumber: newBedNumber !== undefined ? newBedNumber : a.bedNumber,
-            status: 'scheduled',
+            roomId: targetRoomId,
+            bedNumber: targetBedNumber,
+            status: a.status === 'waitlisted' ? 'scheduled' : a.status,
           };
         }
         return a;
@@ -820,13 +1356,86 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
       doctorId: apt.physioId,
       doctorName: doctor?.name || 'Physician',
       sessionType: apt.sessionType,
-      messageEn: `Session for ${patient?.fullName || 'Patient'} rescheduled to ${newDate || apt.date} at ${newTime} (${newRoom || apt.roomOrBed}).`,
-      messageAr: `تمت إعادة جدولة موعد ${patient?.fullName || 'المريض'} إلى تاريخ ${newDate || apt.date} الساعة ${newTime} (${newRoom || apt.roomOrBed}).`,
+      messageEn: `Session for ${patient?.fullName || 'Patient'} rescheduled to ${targetDate} at ${newTime} (${newRoom || apt.roomOrBed}).`,
+      messageAr: `تمت إعادة جدولة موعد ${patient?.fullName || 'المريض'} إلى تاريخ ${targetDate} الساعة ${newTime} (${newRoom || apt.roomOrBed}).`,
       timestamp: new Date().toISOString(),
       isRead: false,
     };
 
     setNotifications((prev) => [reschedNotif, ...prev.slice(0, 19)]);
+
+    logAuditAction(
+      'reschedule',
+      `Rescheduled appointment ${id} to ${targetDate} at ${newTime} (${newRoom || apt.roomOrBed})`,
+      apt,
+      {
+        ...apt,
+        startTime: newTime,
+        date: targetDate,
+        duration: targetDuration,
+        price: updatedPrice,
+        roomOrBed: newRoom || apt.roomOrBed,
+      }
+    );
+
+    return { success: true };
+  };
+
+  const updateAppointmentPrice = (
+    appointmentId: string,
+    newPrice: number
+  ): { success: boolean; error?: string } => {
+    const apt = appointments.find((a) => a.id === appointmentId);
+    if (!apt) return { success: false, error: 'Appointment not found' };
+
+    const hasPayment = paymentReceipts.some((r) => r.appointmentId === appointmentId && !r.isVoided);
+    if (hasPayment && currentRole !== 'admin' && currentRole !== 'co_admin') {
+      return {
+        success: false,
+        error: language === 'ar'
+          ? 'لا يمكن تعديل سعر الجلسة بعد تسجيل دفعة مالية إلا بواسطة المدير'
+          : 'Only clinic admin can change appointment price after a payment exists',
+      };
+    }
+
+    const oldPrice = apt.price || 0;
+    setAppointments((prev) =>
+      prev.map((a) => (a.id === appointmentId ? { ...a, price: newPrice } : a))
+    );
+
+    logAuditAction(
+      'booking_price_update',
+      `Updated appointment ${appointmentId} price from ${oldPrice} EGP to ${newPrice} EGP`,
+      { price: oldPrice },
+      { price: newPrice }
+    );
+
+    return { success: true };
+  };
+
+  const getAppointmentPaymentStatus = (appointmentId: string): {
+    status: 'paid' | 'partial' | 'unpaid' | 'package';
+    totalPaid: number;
+    price: number;
+    balanceDue: number;
+  } => {
+    const appt = appointments.find((a) => a.id === appointmentId);
+    if (!appt) return { status: 'unpaid', totalPaid: 0, price: 0, balanceDue: 0 };
+    if (appt.packageId) return { status: 'package', totalPaid: 0, price: appt.price || 0, balanceDue: 0 };
+
+    const apptReceipts = paymentReceipts.filter((r) => r.appointmentId === appointmentId && !r.isVoided);
+    const totalPaid = apptReceipts.reduce((sum, r) => sum + r.amount, 0);
+    const price = appt.price || 0;
+    const balanceDue = Math.max(0, price - totalPaid);
+
+    let status: 'paid' | 'partial' | 'unpaid' = 'unpaid';
+    if (totalPaid >= price && price > 0) {
+      status = 'paid';
+    } else if (totalPaid > 0) {
+      status = 'partial';
+    }
+
+    return { status, totalPaid, price, balanceDue };
   };
 
   const deleteAppointment = (id: string) => {
@@ -976,7 +1585,7 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
     }));
   };
 
-  const logAuditAction = (action: string, details: string) => {
+  const logAuditAction = (action: string, details: string, before?: any, after?: any) => {
     const activeUser = users.find((u) => u.id === currentUserId);
     const newLog: AuditLog = {
       id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -986,6 +1595,8 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
       userRole: currentRole,
       action,
       details,
+      before,
+      after,
       timestamp: new Date().toISOString(),
     };
     setAuditLogs((prev) => [newLog, ...prev]);
@@ -1085,8 +1696,8 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
 
   const getPatientPackage = (patientId: string): TreatmentPackage | undefined => {
     return (
-      packages.find((p) => p.patientId === patientId && p.status === 'active') ||
-      packages.find((p) => p.patientId === patientId)
+      computedPackages.find((p) => p.patientId === patientId && p.status === 'active') ||
+      computedPackages.find((p) => p.patientId === patientId)
     );
   };
 
@@ -1094,11 +1705,11 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
     return users.find((u) => u.id === physioId);
   };
 
-  const lowSessionAlertsCount = packages.filter(
+  const lowSessionAlertsCount = computedPackages.filter(
     (p) => p.status === 'active' && p.remainingSessions <= 1 && p.balanceDue <= 0
   ).length;
 
-  const balanceDueAlertsCount = packages.filter(
+  const balanceDueAlertsCount = computedPackages.filter(
     (p) => p.status === 'active' && p.balanceDue > 0
   ).length;
 
@@ -1108,7 +1719,7 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
         clinic,
         users,
         patients,
-        packages,
+        packages: computedPackages,
         appointments,
         packageTiers,
         paymentReceipts,
@@ -1134,11 +1745,17 @@ export function ClinicProvider({ children }: { children: React.ReactNode }) {
         setAdminPassword,
         addPackage,
         updatePackage,
+        extendPackage,
+        recordPayment,
+        voidReceipt,
         recordPackagePayment,
         addAppointment,
         updateAppointmentStatus,
         checkInAppointment,
         rescheduleAppointment,
+        updateAppointmentPrice,
+        getAppointmentPaymentStatus,
+        checkAppointmentConflict,
         deleteAppointment,
         notifications,
         dismissNotification,

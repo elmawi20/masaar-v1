@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { useClinic } from '@/context/ClinicContext';
-import { TreatmentPackage, PaymentMethod } from '@/types';
+import { TreatmentPackage, Appointment, Patient, PaymentMethod, PaymentReceipt } from '@/types';
 import { formatEGP } from '@/lib/utils';
 import { ConfirmActionModal } from '@/components/common/ConfirmActionModal';
 import {
@@ -16,20 +16,25 @@ import {
   AlertCircle,
   ShieldCheck,
   Trash2,
+  Receipt,
 } from 'lucide-react';
 
 interface RecordPaymentModalProps {
   isOpen: boolean;
   onClose: () => void;
-  packageItem: TreatmentPackage | null;
+  packageItem?: TreatmentPackage | null;
+  appointmentItem?: Appointment | null;
+  patientItem?: Patient | null;
 }
 
 export function RecordPaymentModal({
   isOpen,
   onClose,
   packageItem,
+  appointmentItem,
+  patientItem,
 }: RecordPaymentModalProps) {
-  const { patients, language, recordPackagePayment } = useClinic();
+  const { patients, language, recordPayment, paymentReceipts } = useClinic();
   const isAr = language === 'ar';
 
   const [paymentAmount, setPaymentAmount] = useState<number | ''>('');
@@ -39,22 +44,71 @@ export function RecordPaymentModal({
   const [isSuccess, setIsSuccess] = useState(false);
   const [compressing, setCompressing] = useState(false);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [createdReceipt, setCreatedReceipt] = useState<PaymentReceipt | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Determine target patient
+  const targetPatientId =
+    packageItem?.patientId ||
+    appointmentItem?.patientId ||
+    patientItem?.id ||
+    '';
+  const patient = patients.find((p) => p.id === targetPatientId) || patientItem;
+
+  // Calculate pricing & balance for package vs appointment vs direct
+  let totalPrice: number | null = null;
+  let paidSoFar = 0;
+  let remainingBalance: number | null = null;
+  let itemTitle = '';
+
+  if (packageItem) {
+    itemTitle = packageItem.packageName;
+    totalPrice = packageItem.totalPrice;
+    paidSoFar = packageItem.amountPaid;
+    remainingBalance = packageItem.balanceDue;
+  } else if (appointmentItem) {
+    itemTitle = `${isAr ? 'جلسة' : 'Session'} (${appointmentItem.date} ${appointmentItem.startTime})`;
+    totalPrice = appointmentItem.price || 0;
+    const apptReceipts = paymentReceipts.filter(
+      (r) => r.appointmentId === appointmentItem.id && !r.isVoided
+    );
+    paidSoFar = apptReceipts.reduce((sum, r) => sum + r.amount, 0);
+    remainingBalance = Math.max(0, (appointmentItem.price || 0) - paidSoFar);
+  } else if (patient) {
+    itemTitle = isAr ? 'دفعة مباشرة لحساب المريض' : 'Direct Patient Payment';
+    totalPrice = null;
+    remainingBalance = null;
+  }
 
   useEffect(() => {
     if (packageItem) {
       setPaymentAmount(packageItem.balanceDue > 0 ? packageItem.balanceDue : 0);
-      setPaymentMethod('instapay');
-      setReceiptImage(null);
-      setNotes('');
-      setIsSuccess(false);
+    } else if (appointmentItem) {
+      const apptReceipts = paymentReceipts.filter(
+        (r) => r.appointmentId === appointmentItem.id && !r.isVoided
+      );
+      const apptPaid = apptReceipts.reduce((sum, r) => sum + r.amount, 0);
+      const bal = Math.max(0, (appointmentItem.price || 0) - apptPaid);
+      setPaymentAmount(bal > 0 ? bal : 0);
+    } else {
+      setPaymentAmount('');
     }
-  }, [packageItem]);
+    setPaymentMethod('instapay');
+    setReceiptImage(null);
+    setNotes('');
+    setIsSuccess(false);
+    setIsSubmitting(false);
+    setCreatedReceipt(null);
+  }, [packageItem, appointmentItem, patientItem, isOpen]);
 
-  if (!isOpen || !packageItem) return null;
+  if (!isOpen || (!packageItem && !appointmentItem && !patientItem)) return null;
 
-  const patient = patients.find((p) => p.id === packageItem.patientId);
+  // Overpayment check (Rule 11)
+  const numericAmount = Number(paymentAmount) || 0;
+  const isOverpayment =
+    remainingBalance !== null && numericAmount > remainingBalance;
 
   // Client-side image compressor (converts transfer receipts & bills into ~40-60 KB WebP)
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -89,21 +143,43 @@ export function RecordPaymentModal({
   const handleSavePayment = (e: React.FormEvent) => {
     e.preventDefault();
     const amount = Number(paymentAmount);
-    if (!amount || amount <= 0) return;
+    if (!amount || amount <= 0 || isSubmitting) return;
+
+    if (isOverpayment) {
+      alert(
+        isAr
+          ? `قيمة التحصيل (${amount} ج.م) أكبر من الرصيد المتبقي (${remainingBalance} ج.م).`
+          : `Payment amount (${amount} EGP) exceeds remaining balance (${remainingBalance} EGP).`
+      );
+      return;
+    }
+
     setShowConfirmModal(true);
   };
 
   const handleExecutePayment = () => {
     const amount = Number(paymentAmount);
-    if (!amount || amount <= 0 || !packageItem) return;
+    if (!amount || amount <= 0 || !patient || isSubmitting) return;
 
-    recordPackagePayment(
-      packageItem.id,
+    setIsSubmitting(true);
+    const res = recordPayment({
+      patientId: patient.id,
       amount,
       paymentMethod,
-      receiptImage || undefined,
-      notes.trim() || undefined
-    );
+      packageId: packageItem?.id,
+      appointmentId: appointmentItem?.id,
+      receiptImage: receiptImage || undefined,
+      notes: notes.trim() || undefined,
+    });
+    setIsSubmitting(false);
+
+    if (!res.success) {
+      alert(res.error || (isAr ? 'فشلت عملية التحصيل' : 'Payment recording failed'));
+      return;
+    }
+
+    setCreatedReceipt(res.receipt || null);
+    setShowConfirmModal(false);
     setIsSuccess(true);
   };
 
@@ -123,10 +199,10 @@ export function RecordPaymentModal({
             </div>
             <div>
               <h3 className="font-bold text-sm sm:text-base">
-                {isAr ? 'تحصيل الرصيد وإرفاق إيصال الدفع' : 'Record Payment & Attach Bill'}
+                {isAr ? 'تحصيل الرصيد وإصدار إيصال الدفع' : 'Record Payment & Issue Receipt'}
               </h3>
               <p className="text-[11px] sm:text-xs text-purple-200">
-                {isAr ? 'تسجيل سداد مستحقات الباقة وإرفاق صورة التحويل' : 'Collect package balance & attach receipt slip'}
+                {isAr ? 'تسجيل سداد مستحقات الجلسات أو الباقات وإرفاق الإيصال' : 'Collect session or package balance & attach receipt'}
               </p>
             </div>
           </div>
@@ -140,36 +216,42 @@ export function RecordPaymentModal({
 
         {/* Modal Body */}
         <div className="p-4 sm:p-6 space-y-5 overflow-y-auto flex-1">
-          {/* Package Balance Summary Card */}
+          {/* Balance Summary Card */}
           <div className="p-4 bg-slate-50 dark:bg-slate-800/60 rounded-2xl border border-slate-200 dark:border-slate-700 space-y-2">
             <div className="flex items-start justify-between">
               <div>
                 <h4 className="font-bold text-slate-900 dark:text-white text-sm">
-                  {packageItem.packageName}
+                  {itemTitle}
                 </h4>
                 <p className="text-xs text-slate-500 dark:text-slate-400">
                   {isAr ? 'المريض:' : 'Patient:'} {patient?.fullName} ({patient?.phone})
                 </p>
               </div>
-              <span className="text-[10px] px-2.5 py-0.5 rounded-full font-bold uppercase bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
-                {isAr ? 'قيد التحصيل' : 'Balance Pending'}
+              <span className={`text-[10px] px-2.5 py-0.5 rounded-full font-bold uppercase border ${
+                remainingBalance === 0
+                  ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                  : 'bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 border-amber-200 dark:border-amber-800'
+              }`}>
+                {remainingBalance === 0 ? (isAr ? 'مسدد بالكامل' : 'Fully Paid') : (isAr ? 'قيد التحصيل' : 'Balance Pending')}
               </span>
             </div>
 
-            <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-200 dark:border-slate-700 text-xs">
-              <div>
-                <span className="text-slate-400 block text-[10px]">{isAr ? 'الإجمالي' : 'Total'}</span>
-                <span className="font-bold text-slate-800 dark:text-slate-200">{formatEGP(packageItem.totalPrice)}</span>
+            {totalPrice !== null && (
+              <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-200 dark:border-slate-700 text-xs">
+                <div>
+                  <span className="text-slate-400 block text-[10px]">{isAr ? 'الإجمالي' : 'Total'}</span>
+                  <span className="font-bold text-slate-800 dark:text-slate-200">{formatEGP(totalPrice)}</span>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-[10px]">{isAr ? 'المسدد سابقاً' : 'Paid So Far'}</span>
+                  <span className="font-bold text-emerald-600 dark:text-emerald-400">{formatEGP(paidSoFar)}</span>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-[10px]">{isAr ? 'المتبقي المستحق' : 'Due Balance'}</span>
+                  <span className="font-bold text-rose-600 dark:text-rose-400">{formatEGP(remainingBalance || 0)}</span>
+                </div>
               </div>
-              <div>
-                <span className="text-slate-400 block text-[10px]">{isAr ? 'المسدد سابقاً' : 'Paid So Far'}</span>
-                <span className="font-bold text-emerald-600 dark:text-emerald-400">{formatEGP(packageItem.amountPaid)}</span>
-              </div>
-              <div>
-                <span className="text-slate-400 block text-[10px]">{isAr ? 'المتبقي المستحق' : 'Due Balance'}</span>
-                <span className="font-bold text-rose-600 dark:text-rose-400">{formatEGP(packageItem.balanceDue)}</span>
-              </div>
-            </div>
+            )}
           </div>
 
           {!isSuccess ? (
@@ -183,11 +265,19 @@ export function RecordPaymentModal({
                   <input
                     type="number"
                     required
+                    min={1}
                     value={paymentAmount}
                     onChange={(e) => setPaymentAmount(e.target.value === '' ? '' : parseFloat(e.target.value))}
-                    className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 text-xs sm:text-sm text-slate-900 dark:text-white font-mono font-bold focus:ring-2 focus:ring-purple-500 focus:outline-none"
+                    className={`w-full bg-slate-50 dark:bg-slate-800 border rounded-xl px-3 py-2 text-xs sm:text-sm text-slate-900 dark:text-white font-mono font-bold focus:ring-2 focus:outline-none ${
+                      isOverpayment ? 'border-rose-400 focus:ring-rose-500' : 'border-slate-200 dark:border-slate-700 focus:ring-purple-500'
+                    }`}
                     placeholder="0"
                   />
+                  {isOverpayment && (
+                    <p className="text-rose-600 dark:text-rose-400 text-[11px] font-semibold mt-1">
+                      ⚠️ {isAr ? `قيمة الدفعة (${paymentAmount} ج.م) أكبر من الرصيد المتبقي (${remainingBalance} ج.م)` : `Amount exceeds remaining balance of ${remainingBalance} EGP.`}
+                    </p>
+                  )}
                 </div>
 
                 <div>
@@ -285,16 +375,26 @@ export function RecordPaymentModal({
                 <button
                   type="button"
                   onClick={onClose}
-                  className="flex-1 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 text-xs font-bold hover:bg-slate-100 dark:hover:bg-slate-800 transition"
+                  disabled={isSubmitting}
+                  className="flex-1 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 text-xs font-bold hover:bg-slate-100 dark:hover:bg-slate-800 transition disabled:opacity-50"
                 >
                   {isAr ? 'إلغاء' : 'Cancel'}
                 </button>
                 <button
                   type="submit"
-                  className="flex-1 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold shadow-md shadow-purple-600/30 transition flex items-center justify-center gap-1.5"
+                  disabled={isSubmitting || Boolean(isOverpayment) || !paymentAmount || Number(paymentAmount) <= 0}
+                  className="flex-1 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold shadow-md shadow-purple-600/30 transition flex items-center justify-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <DollarSign className="w-4 h-4" />
-                  <span>{isAr ? 'تأكيد تسجيل التحصيل' : 'Confirm Payment'}</span>
+                  <span>
+                    {isSubmitting
+                      ? isAr
+                        ? 'جارٍ التحصيل...'
+                        : 'Recording...'
+                      : isAr
+                      ? 'تأكيد تسجيل التحصيل'
+                      : 'Confirm Payment'}
+                  </span>
                 </button>
               </div>
             </form>
@@ -306,8 +406,14 @@ export function RecordPaymentModal({
 
               <div>
                 <h4 className="font-bold text-slate-900 dark:text-white text-base">
-                  {isAr ? 'تم تسجيل التحصيل وتحديث الرصيد!' : 'Payment Recorded Successfully!'}
+                  {isAr ? 'تم تسجيل التحصيل بنجاح!' : 'Payment Recorded Successfully!'}
                 </h4>
+                {createdReceipt?.receiptNumber && (
+                  <div className="my-2 inline-flex items-center gap-1.5 px-3 py-1 bg-purple-100 dark:bg-purple-950 text-purple-700 dark:text-purple-300 rounded-xl font-mono font-bold text-xs border border-purple-200 dark:border-purple-800">
+                    <Receipt className="w-3.5 h-3.5" />
+                    <span>{createdReceipt.receiptNumber}</span>
+                  </div>
+                )}
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
                   {isAr
                     ? `تم تحصيل ${paymentAmount} ج.م عبر ${paymentMethod.toUpperCase()}`
@@ -317,7 +423,7 @@ export function RecordPaymentModal({
 
               <button
                 onClick={handleDone}
-                className="w-full py-2.5 rounded-xl bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-bold hover:opacity-90 transition"
+                className="w-full py-2.5 rounded-xl bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-bold hover:opacity-90 transition cursor-pointer"
               >
                 {isAr ? 'تم ومتابعة' : 'Done'}
               </button>

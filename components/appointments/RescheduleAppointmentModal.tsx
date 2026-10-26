@@ -13,6 +13,7 @@ import {
   MessageSquare,
   AlertCircle,
   Stethoscope,
+  CreditCard,
 } from 'lucide-react';
 import { WhatsAppEditModal } from '@/components/common/WhatsAppEditModal';
 
@@ -35,24 +36,45 @@ export function RescheduleAppointmentModal({
   onClose,
   appointment,
 }: RescheduleAppointmentModalProps) {
-  const { patients, users, clinic, rooms, appointments, language, rescheduleAppointment } = useClinic();
+  const {
+    patients,
+    users,
+    clinic,
+    rooms,
+    language,
+    rescheduleAppointment,
+    checkAppointmentConflict,
+    currentRole,
+    paymentReceipts,
+  } = useClinic();
   const isAr = language === 'ar';
   const activeRooms = rooms.filter((r) => r.isActive);
 
   const [dateInput, setDateInput] = useState('');
   const [timeInput, setTimeInput] = useState('');
   const [roomInput, setRoomInput] = useState('');
+  const [durationInput, setDurationInput] = useState<number>(45);
+  const [priceInput, setPriceInput] = useState<number | ''>(appointment ? (appointment.price || 0) : 0);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
   const [isWaModalOpen, setIsWaModalOpen] = useState(false);
   const [conflictWarning, setConflictWarning] = useState<string | null>(null);
+
+  const hasPayment = appointment
+    ? paymentReceipts.some((r) => r.appointmentId === appointment.id && !r.isVoided)
+    : false;
+  const canChangePrice = !hasPayment || currentRole === 'admin' || currentRole === 'co_admin';
 
   useEffect(() => {
     if (appointment) {
       setDateInput(appointment.date);
       setTimeInput(appointment.startTime);
       setRoomInput(appointment.roomOrBed);
+      setDurationInput(appointment.duration || 45);
+      setPriceInput(appointment.price !== undefined ? appointment.price : 0);
       setIsSuccess(false);
       setConflictWarning(null);
+      setIsSubmitting(false);
     }
   }, [appointment]);
 
@@ -61,45 +83,51 @@ export function RescheduleAppointmentModal({
   const patient = patients.find((p) => p.id === appointment.patientId);
   const physio = users.find((u) => u.id === appointment.physioId);
 
-  // Check conflicts for new time/date
+  // Check conflicts for new time/date/duration/room
   const checkRescheduleConflict = () => {
     if (!dateInput || !timeInput) return null;
-    const timeParts = timeInput.split(':');
-    const newMinutes = parseInt(timeParts[0], 10) * 60 + parseInt(timeParts[1] || '0', 10);
-
-    // 1. Physio conflict
-    const docConflict = appointments.find((apt) => {
-      if (apt.id === appointment.id) return false;
-      if (apt.date !== dateInput || apt.status === 'cancelled' || apt.status === 'no-show') return false;
-      if (apt.physioId !== appointment.physioId) return false;
-
-      const aptParts = apt.startTime.split(':');
-      const aptMinutes = parseInt(aptParts[0], 10) * 60 + parseInt(aptParts[1] || '0', 10);
-      return Math.abs(aptMinutes - newMinutes) < 45;
+    const conflict = checkAppointmentConflict({
+      appointmentId: appointment.id,
+      patientId: appointment.patientId,
+      physioId: appointment.physioId,
+      date: dateInput,
+      startTime: timeInput,
+      duration: durationInput,
+      sessionType: appointment.sessionType,
+      packageId: appointment.packageId,
     });
-
-    if (docConflict) {
-      const otherPatient = patients.find((p) => p.id === docConflict.patientId);
-      return isAr
-        ? `⚠️ تعارض في المواعيد: الطبيب المعالج لديه جلسة أخرى في هذا التوقيت مع (${otherPatient?.fullName || 'مريض آخر'}).`
-        : `⚠️ Scheduling Conflict: Assigned physio is already booked at this time with ${otherPatient?.fullName || 'another patient'}.`;
-    }
-
-    return null;
+    return conflict.hasConflict ? conflict.reason || 'Conflict detected' : null;
   };
 
   const currentConflict = checkRescheduleConflict();
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!dateInput || !timeInput) return;
+    if (!dateInput || !timeInput || isSubmitting) return;
 
     if (currentConflict) {
       setConflictWarning(currentConflict);
       return;
     }
 
-    rescheduleAppointment(appointment.id, timeInput, dateInput, roomInput);
+    setIsSubmitting(true);
+    const res = rescheduleAppointment(
+      appointment.id,
+      timeInput,
+      dateInput,
+      roomInput,
+      undefined,
+      undefined,
+      durationInput,
+      priceInput === '' ? undefined : Number(priceInput)
+    );
+    setIsSubmitting(false);
+
+    if (!res.success) {
+      setConflictWarning(res.error || (isAr ? 'فشلت إعادة الجدولة لوجود تعارض' : 'Reschedule failed due to conflict'));
+      return;
+    }
+
     setIsSuccess(true);
   };
 
@@ -154,9 +182,11 @@ export function RescheduleAppointmentModal({
                 {patient?.phone}
               </span>
             </div>
-            <p className="text-xs text-teal-700 dark:text-teal-400 font-medium">
-              🩺 {patient?.primaryDiagnosis}
-            </p>
+            {currentRole !== 'receptionist' && patient?.primaryDiagnosis && (
+              <p className="text-xs text-teal-700 dark:text-teal-400 font-medium">
+                🩺 {patient.primaryDiagnosis}
+              </p>
+            )}
             <p className="text-[11px] text-slate-500 dark:text-slate-400 font-semibold">
               Dr. {physio?.name} • {appointment.roomOrBed}
             </p>
@@ -200,6 +230,50 @@ export function RescheduleAppointmentModal({
                 />
               </div>
 
+              {/* Duration Input (Rule 3) */}
+              <div>
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1 flex items-center gap-1.5">
+                  <Clock className="w-3.5 h-3.5 text-teal-600" />
+                  <span>{isAr ? 'مدة الجلسة (بالدقائق) *' : 'Session Duration (Minutes) *'}</span>
+                </label>
+                <input
+                  type="number"
+                  required
+                  min={15}
+                  max={180}
+                  step={15}
+                  value={durationInput}
+                  onChange={(e) => setDurationInput(Number(e.target.value))}
+                  className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 text-xs sm:text-sm text-slate-900 dark:text-white font-mono font-bold focus:ring-2 focus:ring-teal-500 focus:outline-none"
+                />
+              </div>
+
+              {/* Price Field (Rule 4: locked if payment exists unless admin) */}
+              <div>
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1 flex items-center justify-between">
+                  <span className="flex items-center gap-1.5">
+                    <CreditCard className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>{isAr ? 'سعر الجلسة (ج.م) *' : 'Session Price (EGP) *'}</span>
+                  </span>
+                  {!canChangePrice && (
+                    <span className="text-[10px] font-bold text-amber-600 dark:text-amber-400 flex items-center gap-0.5">
+                      🔒 {isAr ? 'مدفوعة (تعديل المدير فقط)' : 'Paid (Admin only)'}
+                    </span>
+                  )}
+                </label>
+                <input
+                  type="number"
+                  required
+                  min={0}
+                  disabled={!canChangePrice}
+                  value={priceInput}
+                  onChange={(e) => setPriceInput(e.target.value === '' ? '' : Number(e.target.value))}
+                  className={`w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 text-xs sm:text-sm text-slate-900 dark:text-white font-mono font-bold focus:ring-2 focus:ring-teal-500 focus:outline-none ${
+                    !canChangePrice ? 'opacity-70 cursor-not-allowed bg-slate-100 dark:bg-slate-800/40' : ''
+                  }`}
+                />
+              </div>
+
               {/* Room/Bed Selector */}
               <div>
                 <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1 flex items-center gap-1.5">
@@ -231,21 +305,30 @@ export function RescheduleAppointmentModal({
                 <button
                   type="button"
                   onClick={onClose}
-                  className="flex-1 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 text-xs font-bold hover:bg-slate-100 dark:hover:bg-slate-800 transition"
+                  disabled={isSubmitting}
+                  className="flex-1 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 text-xs font-bold hover:bg-slate-100 dark:hover:bg-slate-800 transition disabled:opacity-50"
                 >
                   {isAr ? 'إلغاء' : 'Cancel'}
                 </button>
                 <button
                   type="submit"
-                  disabled={Boolean(currentConflict)}
+                  disabled={Boolean(currentConflict) || isSubmitting}
                   className={`flex-1 py-2.5 rounded-xl text-white text-xs font-bold shadow-md transition flex items-center justify-center gap-1.5 active:scale-95 ${
-                    currentConflict
+                    currentConflict || isSubmitting
                       ? 'bg-rose-400 cursor-not-allowed opacity-75'
                       : 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-600/30'
                   }`}
                 >
                   <CheckCircle className="w-4 h-4" />
-                  <span>{isAr ? 'تأكيد الحجز الجديد' : 'Save Reschedule'}</span>
+                  <span>
+                    {isSubmitting
+                      ? isAr
+                        ? 'جارٍ الحفظ...'
+                        : 'Saving...'
+                      : isAr
+                      ? 'تأكيد الحجز الجديد'
+                      : 'Save Reschedule'}
+                  </span>
                 </button>
               </div>
             </form>

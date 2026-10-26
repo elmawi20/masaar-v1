@@ -57,6 +57,7 @@ export function AdminOverview({ onNavigateToAdminConsole }: AdminOverviewProps) 
     currentRole,
     addExpense,
     logAuditAction,
+    voidReceipt,
   } = useClinic();
   const isAr = language === 'ar';
 
@@ -75,6 +76,15 @@ export function AdminOverview({ onNavigateToAdminConsole }: AdminOverviewProps) 
   const [isExpensesConsoleOpen, setIsExpensesConsoleOpen] = useState(false);
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
   const [payoutToast, setPayoutToast] = useState('');
+  const [voidModalState, setVoidModalState] = useState<{
+    isOpen: boolean;
+    receipt: PaymentReceipt | null;
+    reason: string;
+  }>({
+    isOpen: false,
+    receipt: null,
+    reason: '',
+  });
 
   // Filter payment receipts by selected audit timeframe
   const filteredReceipts = paymentReceipts.filter((rcpt) => {
@@ -114,17 +124,18 @@ export function AdminOverview({ onNavigateToAdminConsole }: AdminOverviewProps) 
 
   const periodExpenses = filteredExpenses.reduce((sum, e) => sum + e.amount, 0);
 
-  // Calculate Period Metrics
-  const periodCollectedRevenue = filteredReceipts.reduce((sum, r) => sum + r.amount, 0);
+  // Calculate Period Metrics (Voided receipts are excluded from collected revenue totals)
+  const nonVoidedReceipts = filteredReceipts.filter((r) => !r.isVoided);
+  const periodCollectedRevenue = nonVoidedReceipts.reduce((sum, r) => sum + r.amount, 0);
   const netOperatingProfit = periodCollectedRevenue - periodExpenses;
   const totalOutstanding = packages.reduce((sum, p) => sum + p.balanceDue, 0);
   const totalCompletedSessions = packages.reduce((sum, p) => sum + p.completedSessions, 0);
   const activePatientsCount = patients.filter((p) => p.status === 'active').length;
 
-  // Selected Day specific calculations for Net Revenue per Day
+  // Selected Day specific calculations for Net Revenue per Day (excluding voided)
   const selectedDayReceipts = paymentReceipts.filter((r) => {
     const d = (r.date || '').split('T')[0];
-    return d === selectedAuditDate;
+    return d === selectedAuditDate && !r.isVoided;
   });
   const selectedDayRevenue = selectedDayReceipts.reduce((sum, r) => sum + r.amount, 0);
   const selectedDayExpensesList = expenses.filter((e) => {
@@ -164,7 +175,7 @@ export function AdminOverview({ onNavigateToAdminConsole }: AdminOverviewProps) 
     }
   };
 
-  // Breakdown by payment method for selected period
+  // Breakdown by payment method for selected period (non-voided only)
   const methodTotals: Record<PaymentMethod, number> = {
     instapay: 0,
     vodafone_cash: 0,
@@ -173,7 +184,7 @@ export function AdminOverview({ onNavigateToAdminConsole }: AdminOverviewProps) 
     fawry: 0,
   };
 
-  filteredReceipts.forEach((r) => {
+  nonVoidedReceipts.forEach((r) => {
     if (methodTotals[r.paymentMethod] !== undefined) {
       methodTotals[r.paymentMethod] += r.amount;
     }
@@ -767,30 +778,48 @@ export function AdminOverview({ onNavigateToAdminConsole }: AdminOverviewProps) 
                 const pat = patients.find((p) => p.id === rcpt.patientId);
                 const pkg = packages.find((p) => p.id === rcpt.packageId);
                 const meta = paymentMethodLabels[rcpt.paymentMethod];
+                const isVoid = !!rcpt.isVoided;
 
                 return (
                   <div
                     key={rcpt.id}
-                    className="bg-slate-50 dark:bg-slate-800/60 p-3.5 rounded-2xl border border-slate-100 dark:border-slate-800 space-y-2.5"
+                    className={`p-3.5 rounded-2xl border space-y-2.5 transition ${
+                      isVoid
+                        ? 'bg-rose-50/30 dark:bg-rose-950/20 border-rose-200 dark:border-rose-900/40 opacity-75'
+                        : 'bg-slate-50 dark:bg-slate-800/60 border-slate-100 dark:border-slate-800'
+                    }`}
                   >
                     <div className="flex items-center justify-between">
                       <div>
-                        <span className="font-bold text-slate-900 dark:text-white text-xs block">
-                          {pat?.fullName || 'Patient'}
-                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <span className={`font-bold text-xs block ${isVoid ? 'line-through text-slate-500' : 'text-slate-900 dark:text-white'}`}>
+                            {pat?.fullName || 'Patient'}
+                          </span>
+                          {isVoid && (
+                            <span className="px-1.5 py-0.2 rounded text-[9px] font-extrabold bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-300 border border-rose-200">
+                              {isAr ? 'ملغي' : 'VOIDED'}
+                            </span>
+                          )}
+                        </div>
                         <span className="text-[10px] text-slate-400 font-mono">
-                          {rcpt.date.split('T')[0]} • {rcpt.collectedBy || 'Reception'}
+                          {rcpt.receiptNumber ? `${rcpt.receiptNumber} • ` : ''}{rcpt.date.split('T')[0]} • {rcpt.collectedBy || 'Reception'}
                         </span>
                       </div>
 
-                      <span className="font-bold text-emerald-600 dark:text-emerald-400 font-mono text-sm">
+                      <span className={`font-bold font-mono text-sm ${isVoid ? 'line-through text-slate-400' : 'text-emerald-600 dark:text-emerald-400'}`}>
                         +{formatEGP(rcpt.amount, language)}
                       </span>
                     </div>
 
                     <div className="text-[11px] text-slate-600 dark:text-slate-300 truncate">
-                      {pkg?.packageName || rcpt.packageId}
+                      {pkg?.packageName || (rcpt.appointmentId ? (isAr ? 'جلسة منفردة / كشف' : 'Direct Visit') : (isAr ? 'دفعة مريض مباشرة' : 'Direct Payment'))}
                     </div>
+
+                    {isVoid && rcpt.voidReason && (
+                      <div className="text-[10px] text-rose-600 dark:text-rose-400 italic bg-rose-50 dark:bg-rose-950/40 px-2 py-1 rounded-lg border border-rose-200/60 dark:border-rose-800/60">
+                        {isAr ? 'سبب الإلغاء: ' : 'Void reason: '}{rcpt.voidReason}
+                      </div>
+                    )}
 
                     <div className="flex items-center justify-between pt-1 border-t border-slate-200/60 dark:border-slate-700/60">
                       <span
@@ -799,15 +828,25 @@ export function AdminOverview({ onNavigateToAdminConsole }: AdminOverviewProps) 
                         {isAr ? meta.labelAr : meta.label}
                       </span>
 
-                      {rcpt.receiptImage && (
-                        <button
-                          onClick={() => setPreviewReceiptImage(rcpt.receiptImage || null)}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-teal-50 dark:bg-teal-950/40 text-teal-700 dark:text-teal-300 hover:bg-teal-100 text-[11px] font-bold border border-teal-200 dark:border-teal-800 transition"
-                        >
-                          <Eye className="w-3 h-3" />
-                          <span>{isAr ? 'عرض الإيصال' : 'View Bill'}</span>
-                        </button>
-                      )}
+                      <div className="flex items-center gap-1.5">
+                        {rcpt.receiptImage && (
+                          <button
+                            onClick={() => setPreviewReceiptImage(rcpt.receiptImage || null)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-teal-50 dark:bg-teal-950/40 text-teal-700 dark:text-teal-300 hover:bg-teal-100 text-[11px] font-bold border border-teal-200 dark:border-teal-800 transition"
+                          >
+                            <Eye className="w-3 h-3" />
+                            <span>{isAr ? 'عرض' : 'Bill'}</span>
+                          </button>
+                        )}
+                        {!isVoid && (currentRole === 'admin' || currentRole === 'co_admin') && (
+                          <button
+                            onClick={() => setVoidModalState({ isOpen: true, receipt: rcpt, reason: '' })}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 hover:bg-rose-100 text-[11px] font-bold border border-rose-200 dark:border-rose-800 transition"
+                          >
+                            <span>{isAr ? 'إلغاء' : 'Void'}</span>
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 );
@@ -819,13 +858,14 @@ export function AdminOverview({ onNavigateToAdminConsole }: AdminOverviewProps) 
               <table className="w-full text-left text-xs">
               <thead className="bg-slate-50 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 uppercase font-semibold border-b border-slate-100 dark:border-slate-800">
                 <tr>
+                  <th className="py-2.5 px-3">{isAr ? 'رقم الإيصال' : 'Receipt #'}</th>
                   <th className="py-2.5 px-3">{isAr ? 'التاريخ' : 'Date'}</th>
                   <th className="py-2.5 px-3">{isAr ? 'المريض' : 'Patient'}</th>
-                  <th className="py-2.5 px-3">{isAr ? 'الباقة العلاجية' : 'Package'}</th>
+                  <th className="py-2.5 px-3">{isAr ? 'البند / الباقة' : 'Item / Package'}</th>
                   <th className="py-2.5 px-3">{isAr ? 'المبلغ المحصل' : 'Amount Paid'}</th>
                   <th className="py-2.5 px-3">{isAr ? 'طريقة الدفع' : 'Method'}</th>
                   <th className="py-2.5 px-3">{isAr ? 'المسؤول' : 'Collected By'}</th>
-                  <th className="py-2.5 px-3 text-right">{isAr ? 'الإيصال / الفاتورة' : 'Bill Receipt'}</th>
+                  <th className="py-2.5 px-3 text-right">{isAr ? 'الإجراءات' : 'Actions'}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
@@ -833,20 +873,49 @@ export function AdminOverview({ onNavigateToAdminConsole }: AdminOverviewProps) 
                   const pat = patients.find((p) => p.id === rcpt.patientId);
                   const pkg = packages.find((p) => p.id === rcpt.packageId);
                   const meta = paymentMethodLabels[rcpt.paymentMethod];
+                  const isVoid = !!rcpt.isVoided;
 
                   return (
-                    <tr key={rcpt.id} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/40 transition">
+                    <tr
+                      key={rcpt.id}
+                      className={`transition ${
+                        isVoid
+                          ? 'bg-rose-50/20 dark:bg-rose-950/15 opacity-75'
+                          : 'hover:bg-slate-50/50 dark:hover:bg-slate-800/40'
+                      }`}
+                    >
+                      <td className="py-3 px-3 font-mono font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap">
+                        <div className="flex items-center gap-1.5">
+                          <span className={isVoid ? 'line-through text-slate-400' : ''}>
+                            {rcpt.receiptNumber || rcpt.id}
+                          </span>
+                          {isVoid && (
+                            <span className="px-1.5 py-0.2 rounded text-[9px] font-extrabold bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-300 border border-rose-200">
+                              {isAr ? 'ملغي' : 'VOIDED'}
+                            </span>
+                          )}
+                        </div>
+                        {isVoid && rcpt.voidReason && (
+                          <div className="text-[10px] text-rose-600 dark:text-rose-400 font-normal italic">
+                            {rcpt.voidReason}
+                          </div>
+                        )}
+                      </td>
                       <td className="py-3 px-3 font-mono text-slate-500 whitespace-nowrap">
                         {rcpt.date.split('T')[0]}
                       </td>
                       <td className="py-3 px-3 font-bold text-slate-900 dark:text-white">
-                        {pat?.fullName || 'Patient'}
+                        <span className={isVoid ? 'line-through text-slate-500' : ''}>
+                          {pat?.fullName || 'Patient'}
+                        </span>
                       </td>
                       <td className="py-3 px-3 text-slate-600 dark:text-slate-400 max-w-[200px] truncate">
-                        {pkg?.packageName || rcpt.packageId}
+                        {pkg?.packageName || (rcpt.appointmentId ? (isAr ? 'جلسة فردية / كشف' : 'Direct Visit') : (isAr ? 'دفعة مريض مباشرة' : 'Direct Payment'))}
                       </td>
-                      <td className="py-3 px-3 font-bold text-emerald-600 dark:text-emerald-400 font-mono">
-                        +{formatEGP(rcpt.amount, language)}
+                      <td className="py-3 px-3 font-bold font-mono">
+                        <span className={isVoid ? 'line-through text-slate-400' : 'text-emerald-600 dark:text-emerald-400'}>
+                          +{formatEGP(rcpt.amount, language)}
+                        </span>
                       </td>
                       <td className="py-3 px-3">
                         <span
@@ -859,20 +928,32 @@ export function AdminOverview({ onNavigateToAdminConsole }: AdminOverviewProps) 
                         {rcpt.collectedBy || 'Reception'}
                       </td>
                       <td className="py-3 px-3 text-right">
-                        {rcpt.receiptImage ? (
-                          <button
-                            onClick={() => setPreviewReceiptImage(rcpt.receiptImage || null)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-teal-50 dark:bg-teal-950/40 text-teal-700 dark:text-teal-300 hover:bg-teal-100 text-[11px] font-bold border border-teal-200 dark:border-teal-800 transition"
-                            title={isAr ? 'عرض صورة الإيصال المرفق' : 'View attached receipt'}
-                          >
-                            <Eye className="w-3 h-3" />
-                            <span>{isAr ? 'عرض الإيصال' : 'View Bill'}</span>
-                          </button>
-                        ) : (
-                          <span className="text-slate-400 text-[11px] font-mono">
-                            {rcpt.notes ? rcpt.notes.slice(0, 20) : '—'}
-                          </span>
-                        )}
+                        <div className="flex items-center justify-end gap-1.5">
+                          {rcpt.receiptImage ? (
+                            <button
+                              onClick={() => setPreviewReceiptImage(rcpt.receiptImage || null)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-teal-50 dark:bg-teal-950/40 text-teal-700 dark:text-teal-300 hover:bg-teal-100 text-[11px] font-bold border border-teal-200 dark:border-teal-800 transition"
+                              title={isAr ? 'عرض صورة الإيصال المرفق' : 'View attached receipt'}
+                            >
+                              <Eye className="w-3 h-3" />
+                              <span>{isAr ? 'عرض' : 'Bill'}</span>
+                            </button>
+                          ) : (
+                            <span className="text-slate-400 text-[11px] font-mono mr-1">
+                              {rcpt.notes ? rcpt.notes.slice(0, 15) : '—'}
+                            </span>
+                          )}
+
+                          {!isVoid && (currentRole === 'admin' || currentRole === 'co_admin') && (
+                            <button
+                              onClick={() => setVoidModalState({ isOpen: true, receipt: rcpt, reason: '' })}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 hover:bg-rose-100 text-[11px] font-bold border border-rose-200 dark:border-rose-800 transition"
+                              title={isAr ? 'إلغاء الإيصال للمدير فقط' : 'Void receipt (Admin only)'}
+                            >
+                              <span>{isAr ? 'إلغاء' : 'Void'}</span>
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );
@@ -883,6 +964,83 @@ export function AdminOverview({ onNavigateToAdminConsole }: AdminOverviewProps) 
           </>
         )}
       </div>
+
+      {/* Admin Void Receipt Modal */}
+      {voidModalState.isOpen && voidModalState.receipt && (
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 animate-in fade-in">
+          <div className="bg-white dark:bg-slate-900 rounded-3xl max-w-sm w-full shadow-2xl border border-rose-200 dark:border-rose-800 p-5 space-y-4">
+            <h4 className="font-extrabold text-slate-900 dark:text-white text-sm sm:text-base flex items-center gap-2">
+              <span className="w-2.5 h-2.5 rounded-full bg-rose-500" />
+              <span>{isAr ? 'إلغاء إيصال استلام نقدية (Admin)' : 'Void Payment Receipt (Admin)'}</span>
+            </h4>
+
+            <div className="p-3 bg-slate-50 dark:bg-slate-800/60 rounded-xl space-y-1 text-xs">
+              <div className="flex justify-between">
+                <span className="text-slate-500">{isAr ? 'رقم الإيصال:' : 'Receipt #:'}</span>
+                <span className="font-mono font-bold text-slate-900 dark:text-white">
+                  {voidModalState.receipt.receiptNumber || voidModalState.receipt.id}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500">{isAr ? 'المبلغ:' : 'Amount:'}</span>
+                <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">
+                  {formatEGP(voidModalState.receipt.amount, language)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500">{isAr ? 'التاريخ:' : 'Date:'}</span>
+                <span className="text-slate-700 dark:text-slate-300">
+                  {voidModalState.receipt.date.split('T')[0]}
+                </span>
+              </div>
+            </div>
+
+            <p className="text-xs text-rose-600 dark:text-rose-400">
+              {isAr
+                ? 'تنبيه: سيتم استبعاد الإيصال من الإيرادات وسيبقى مرئياً ومشطوباً، مع تسجيل العملية في سجل التدقيق.'
+                : 'Notice: The receipt will be excluded from revenues, remain visible as struck-through, and logged in audit.'}
+            </p>
+
+            <div className="space-y-1">
+              <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                {isAr ? 'سبب الإلغاء (مطلوب):' : 'Void Reason (Required):'}
+              </label>
+              <textarea
+                rows={3}
+                value={voidModalState.reason}
+                onChange={(e) => setVoidModalState((prev) => ({ ...prev, reason: e.target.value }))}
+                placeholder={isAr ? 'مثال: خطأ في إدخال المبلغ / تحويل مكرر / استرداد المبلغ...' : 'e.g. Data entry error / duplicate transfer / refund...'}
+                className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-2.5 text-xs text-slate-900 dark:text-white outline-none focus:ring-2 focus:ring-rose-500"
+              />
+            </div>
+
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setVoidModalState({ isOpen: false, receipt: null, reason: '' })}
+                className="px-3 py-1.5 rounded-xl text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-medium"
+              >
+                {isAr ? 'تراجع' : 'Cancel'}
+              </button>
+              <button
+                type="button"
+                disabled={!voidModalState.reason.trim()}
+                onClick={() => {
+                  const res = voidReceipt(voidModalState.receipt!.id, voidModalState.reason);
+                  if (!res.success) {
+                    alert(res.error || 'Failed to void receipt');
+                    return;
+                  }
+                  setVoidModalState({ isOpen: false, receipt: null, reason: '' });
+                }}
+                className="px-4 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-bold shadow-xs"
+              >
+                {isAr ? 'تأكيد الإلغاء' : 'Confirm Void'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 5. Lightbox Modal for Attached Receipt Screenshot */}
       {previewReceiptImage && (
